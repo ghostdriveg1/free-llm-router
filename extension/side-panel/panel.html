@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nancy — Control Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="panel.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="main-header">
+      <div class="brand">
+        <div class="logo">
+          <span class="logo-pulse"></span>
+          🧠
+        </div>
+        <div class="brand-text">
+          <h1>Nancy</h1>
+          <p>Free Chatbot relay</p>
+        </div>
+      </div>
+      <div class="connection-status" id="connection-status-badge">
+        <span class="status-dot"></span>
+        <span class="status-text">Disconnected</span>
+      </div>
+    </header>
+
+    <main class="dashboard-content">
+      <!-- Section: Providers -->
+      <section class="dashboard-section card glass">
+        <div class="section-header">
+          <h2>Provider Sessions</h2>
+          <span class="badge" id="healthy-providers-count">0/5 Active</span>
+        </div>
+        <div class="providers-grid" id="providers-list">
+          <!-- ChatGPT -->
+          <div class="provider-card" data-provider="chatgpt">
+            <div class="provider-info">
+              <span class="provider-name">ChatGPT</span>
+              <span class="provider-indicator offline"></span>
+            </div>
+            <button class="btn btn-sm btn-outline btn-open-tab" data-provider="chatgpt">Open Tab</button>
+          </div>
+          <!-- Gemini -->
+          <div class="provider-card" data-provider="gemini">
+            <div class="provider-info">
+              <span class="provider-name">Gemini</span>
+              <span class="provider-indicator offline"></span>
+            </div>
+            <button class="btn btn-sm btn-outline btn-open-tab" data-provider="gemini">Open Tab</button>
+          </div>
+          <!-- DeepSeek -->
+          <div class="provider-card" data-provider="deepseek">
+            <div class="provider-info">
+              <span class="provider-name">DeepSeek</span>
+              <span class="provider-indicator offline"></span>
+            </div>
+            <button class="btn btn-sm btn-outline btn-open-tab" data-provider="deepseek">Open Tab</button>
+          </div>
+          <!-- Kimi -->
+          <div class="provider-card" data-provider="kimi">
+            <div class="provider-info">
+              <span class="provider-name">Kimi</span>
+              <span class="provider-indicator offline"></span>
+            </div>
+            <button class="btn btn-sm btn-outline btn-open-tab" data-provider="kimi">Open Tab</button>
+          </div>
+          <!-- Claude -->
+          <div class="provider-card" data-provider="claude">
+            <div class="provider-info">
+              <span class="provider-name">Claude</span>
+              <span class="provider-indicator offline"></span>
+            </div>
+            <button class="btn btn-sm btn-outline btn-open-tab" data-provider="claude">Open Tab</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Section: Queue -->
+      <section class="dashboard-section card glass">
+        <div class="section-header">
+          <h2>In-Flight Tasks</h2>
+          <span class="badge badge-accent" id="active-tasks-count">0 Active</span>
+        </div>
+        <div class="task-list-container">
+          <table class="task-table">
+            <thead>
+              <tr>
+                <th>Task ID</th>
+                <th>Provider</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="task-queue-body">
+              <tr class="empty-state">
+                <td colspan="3">No active relay tasks.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Section: Settings -->
+      <section class="dashboard-section card glass">
+        <div class="section-header">
+          <h2>Relay Config</h2>
+        </div>
+        <form id="settings-form" class="settings-form">
+          <div class="form-group">
+            <label for="input-hf-url">Nancy Server URL</label>
+            <input type="url" id="input-hf-url" placeholder="https://your-space.hf.space" required>
+          </div>
+          <div class="form-group">
+            <label for="input-api-key">Auth Token / API Key</label>
+            <input type="password" id="input-api-key" placeholder="Enter NANCY_API_KEY">
+          </div>
+          <div class="form-group">
+            <label for="select-typing-mode">Typing Cadence Mode</label>
+            <select id="select-typing-mode" style="width: 100%; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; padding: 0.5rem; color: #fff; font-family: inherit; outline: none; transition: border-color 0.2s ease;">
+              <option value="standard">Standard (Safe, Human-like)</option>
+              <option value="fast">Fast (Instant Prompt Injection)</option>
+            </select>
+          </div>
+          <div class="settings-actions">
+            <button type="submit" class="btn btn-primary" id="btn-save-settings">Save Config</button>
+            <button type="button" class="btn btn-secondary" id="btn-reconnect">Reconnect</button>
+          </div>
+        </form>
+      </section>
+
+      <!-- Section: Console Logs -->
+      <section class="dashboard-section card glass flex-grow">
+        <div class="section-header">
+          <h2>Console Monitor</h2>
+          <button class="btn btn-sm btn-secondary" id="btn-clear-logs">Clear</button>
+        </div>
+        <div class="console-log-box" id="console-logs">
+          <!-- Logs get injected here -->
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="panel.js" type="module"></script>
+</body>
+</html>

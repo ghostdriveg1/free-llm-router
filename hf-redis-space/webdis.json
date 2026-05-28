@@ -1,0 +1,55 @@
+{
+  "redis_host": "127.0.0.1",
+  "redis_port": 6379,
+  "http_host": "0.0.0.0",
+  "http_port": 7860,
+  "threads": 2,
+  "workers": 2,
+  "daemonize": false,
+  "database": 0,
+  "acl": [
+    {
+      "disabled": [
+        "FLUSHALL",
+        "FLUSHDB",
+        "SHUTDOWN",
+        "SAVE",
+        "BGSAVE",
+        "BGREWRITEAOF",
+        "CONFIG",
+        "DEBUG",
+        "MONITOR",
+        "SLAVEOF",
+        "SYNC"
+      ]
+    },
+    {
+      "http_profile": "nancy_admin",
+      "enabled": [
+        "PING",
+        "GET",
+        "SET",
+        "DEL",
+        "EXISTS",
+        "EXPIRE",
+        "TTL",
+        "INCR",
+        "LPUSH",
+        "RPUSH",
+        "LPOP",
+        "RPOP",
+        "LRANGE",
+        "SADD",
+        "SREM",
+        "SMEMBERS",
+        "SISMEMBER",
+        "HSET",
+        "HGET",
+        "HDEL",
+        "HGETALL"
+      ]
+    }
+  ],
+  "verbosity": 4,
+  "logfile": "/var/log/webdis.log"
+}

@@ -1,0 +1,5262 @@
+============================================================
+FILE: extension/manifest.json
+============================================================
+{
+  "manifest_version": 3,
+  "name": "Nancy — Free LLM Router",
+  "version": "0.1.0",
+  "description": "Browser-side relay that converts free chatbot UIs into OpenAI-compatible API endpoints via Nancy HF Space.",
+  "minimum_chrome_version": "116",
+
+  "permissions": [
+    "tabs",
+    "storage",
+    "alarms",
+    "sidePanel",
+    "activeTab",
+    "debugger"
+  ],
+
+  "host_permissions": [
+    "https://chat.openai.com/*",
+    "https://chatgpt.com/*",
+    "https://gemini.google.com/*",
+    "https://chat.deepseek.com/*",
+    "https://kimi.moonshot.cn/*",
+    "https://claude.ai/*"
+  ],
+
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+
+  "side_panel": {
+    "default_path": "side-panel/panel.html"
+  },
+
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chat.openai.com/*",
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "content-scripts/input-simulator.js",
+        "content-scripts/isolated-observer.js"
+      ],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": [
+        "https://chat.openai.com/*",
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "content-scripts/main-interceptor.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://gemini.google.com/*"
+      ],
+      "js": [
+        "content-scripts/input-simulator.js",
+        "content-scripts/isolated-observer.js"
+      ],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": [
+        "https://gemini.google.com/*"
+      ],
+      "js": [
+        "content-scripts/main-interceptor.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://chat.deepseek.com/*"
+      ],
+      "js": [
+        "content-scripts/input-simulator.js",
+        "content-scripts/isolated-observer.js"
+      ],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": [
+        "https://chat.deepseek.com/*"
+      ],
+      "js": [
+        "content-scripts/main-interceptor.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://kimi.moonshot.cn/*"
+      ],
+      "js": [
+        "content-scripts/input-simulator.js",
+        "content-scripts/isolated-observer.js"
+      ],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": [
+        "https://kimi.moonshot.cn/*"
+      ],
+      "js": [
+        "content-scripts/main-interceptor.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://claude.ai/*"
+      ],
+      "js": [
+        "content-scripts/input-simulator.js",
+        "content-scripts/isolated-observer.js"
+      ],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": [
+        "https://claude.ai/*"
+      ],
+      "js": [
+        "content-scripts/main-interceptor.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ],
+
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+
+  "action": {
+    "default_title": "Nancy — Open Side Panel"
+  }
+}
+
+
+
+============================================================
+FILE: extension/service-worker.js
+============================================================
+/**
+ * @fileoverview Central background service worker for Nancy Chrome Extension.
+ * Coordinates connection with Nancy HF Space server, handles task routing,
+ * manages tab lifecycle, and relays response chunks back to the server.
+ * @module service-worker
+ */
+
+import { getAdapter } from './adapters/base.js';
+import './adapters/chatgpt.js'; // Registers ChatGPT adapter
+import './adapters/gemini.js';  // Registers Gemini adapter
+import './adapters/deepseek.js';// Registers DeepSeek adapter
+import './adapters/kimi.js';    // Registers Kimi adapter
+import './adapters/claude.js';  // Registers Claude adapter
+import './adapters/nim.js';     // Registers NVIDIA NIM Portal adapter
+import './adapters/zai.js';     // Registers z.ai adapter
+import * as storage from './utils/storage.js';
+import { SSEParser } from './utils/sse-parser.js';
+import { sleep } from './utils/timing.js';
+
+const EXTENSION_ID = 'nancy-extension-' + Math.random().toString(36).substr(2, 9);
+let activeReader = null;
+let reconnectTimer = null;
+let currentTaskMap = new Map(); // task_id -> { providerKey, tabId }
+
+// ─── Startup Hook ───────────────────────────────────────────────────────────
+chrome.runtime.onInstalled.addListener(async () => {
+  await storage.resetState();
+  await storage.appendLog('info', `Nancy installed. Extension ID: ${EXTENSION_ID}`);
+  
+  // Enable opening side panel when clicking the extension icon
+  if (chrome.sidePanel && chrome.sidePanel.setPanelBehavior) {
+    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+  }
+  
+  setupAlarms();
+  connectToServer();
+});
+
+chrome.runtime.onStartup.addListener(async () => {
+  await storage.appendLog('info', 'Nancy service worker started.');
+  
+  if (chrome.sidePanel && chrome.sidePanel.setPanelBehavior) {
+    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
+  }
+  
+  setupAlarms();
+  connectToServer();
+});
+
+// ─── Alarms & Keep-Alive ─────────────────────────────────────────────────────
+function setupAlarms() {
+  // Alarms keep the worker alive and schedule periodic heartbeats
+  chrome.alarms.clearAll(() => {
+    chrome.alarms.create('heartbeat', { periodInMinutes: 0.4 }); // Every ~24s
+    chrome.alarms.create('connection_check', { periodInMinutes: 1.0 }); // Every 60s
+  });
+}
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === 'heartbeat') {
+    await sendHeartbeat();
+  } else if (alarm.name === 'connection_check') {
+    const state = await storage.getState();
+    if (!state.connected) {
+      await storage.appendLog('warn', 'Connection check: offline. Reconnecting...');
+      connectToServer();
+    }
+  }
+});
+
+// ─── SSE Streaming Connection ────────────────────────────────────────────────
+async function connectToServer() {
+  if (activeReader) {
+    try {
+      await activeReader.cancel();
+    } catch {}
+    activeReader = null;
+  }
+
+  const state = await storage.getState();
+  const url = state.hfSpaceUrl;
+  const key = state.apiKey || 'nancy-dev-key'; // Fallback to dev key
+
+  if (!url) {
+    await storage.appendLog('error', 'Nancy Server URL not configured.');
+    return;
+  }
+
+  await storage.appendLog('info', `Connecting to Nancy server at ${url}...`);
+  await storage.setState({ connected: false });
+
+  const streamUrl = `${url.replace(/\/$/, '')}/ext/tasks/stream?extension_id=${EXTENSION_ID}`;
+  const sseParser = new SSEParser();
+
+  try {
+    const response = await fetch(streamUrl, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${key}`,
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Server returned HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    await storage.setState({ connected: true });
+    await storage.appendLog('info', 'SSE connection established successfully.');
+
+    const reader = response.body.getReader();
+    activeReader = reader;
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        await storage.appendLog('info', 'SSE connection closed by server.');
+        break;
+      }
+
+      const chunkText = decoder.decode(value, { stream: true });
+      const events = sseParser.feed(chunkText);
+
+      for (const event of events) {
+        if (event.event === 'task') {
+          try {
+            const task = JSON.parse(event.data);
+            await storage.appendLog('info', `Received task ${task.task_id} for ${task.provider}`);
+            // Fire-and-forget task execution
+            executeTask(task);
+          } catch (e) {
+            await storage.appendLog('error', `Failed to parse task: ${e.message}`);
+          }
+        } else if (event.event === 'ping') {
+          // Keep-alive heartbeat acknowledgement
+          await storage.updateProvider('chatgpt', { lastSeen: Date.now() });
+        }
+      }
+    }
+  } catch (err) {
+    await storage.setState({ connected: false });
+    await storage.appendLog('error', `SSE connection error: ${err.message}`);
+    scheduleReconnect();
+  }
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    connectToServer();
+  }, 10000); // Reconnect after 10 seconds
+}
+
+// ─── Heartbeat ───────────────────────────────────────────────────────────────
+async function sendHeartbeat() {
+  const state = await storage.getState();
+  if (!state.hfSpaceUrl) return;
+
+  const secret = state.apiKey || 'nancy-ext-dev-secret';
+  const url = `${state.hfSpaceUrl.replace(/\/$/, '')}/ext/heartbeat`;
+
+  try {
+    const activeTasks = Array.from(currentTaskMap.keys());
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${secret}`,
+      },
+      body: JSON.stringify({
+        extension_id: EXTENSION_ID,
+        timestamp: Date.now() / 1000,
+        active_tasks: activeTasks,
+      }),
+    });
+
+    if (response.ok) {
+      const result = await response.json();
+      logger(`Heartbeat ok: ${result.status}`);
+    } else {
+      logger(`Heartbeat failed: HTTP ${response.status}`);
+    }
+  } catch (err) {
+    logger(`Heartbeat catch: ${err.message}`);
+  }
+}
+
+function logger(msg) {
+  console.log(`[Nancy/SW] ${msg}`);
+}
+
+// ─── Task Execution Lifecycle ────────────────────────────────────────────────
+function formatMessageHistory(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return '';
+  if (messages.length === 1) {
+    return messages[0].content || '';
+  }
+  
+  let formatted = "Below is the full conversation history and context. Please respond to the last user message as the assistant:\n\n";
+  messages.forEach((msg) => {
+    const role = msg.role.toUpperCase();
+    const content = msg.content || '';
+    formatted += `[${role}]: ${content}\n\n`;
+  });
+  formatted += "Please generate your response as the assistant now:";
+  return formatted;
+}
+
+async function executeTask(task) {
+  const { task_id, provider, messages, action, conversation_url, session_id } = task;
+  const fullPrompt = formatMessageHistory(messages);
+
+  if (!fullPrompt) {
+    await reportError(task_id, 'No message content found in task payload.');
+    return;
+  }
+
+  // Persist task state in local storage
+  await storage.enqueueTask({
+    taskId: task_id,
+    provider: provider,
+    status: 'pending',
+    prompt: fullPrompt.length > 60 ? fullPrompt.substr(0, 57) + '...' : fullPrompt,
+    created: Date.now(),
+  });
+
+  try {
+    let tab;
+
+    // ── Session-aware tab navigation ──────────────────────────────────
+    if (action === 'new_chat') {
+      // Force a fresh conversation by navigating to the provider's base URL
+      const adapter = getAdapter(provider);
+      if (!adapter) throw new Error(`Provider adapter '${provider}' is not supported.`);
+      const baseUrl = `https://${adapter.urlPatterns[0]}`;
+      const existingTabs = await chrome.tabs.query({});
+      const matchedTab = existingTabs.find(t => t.url && adapter.matchesUrl(t.url));
+      if (matchedTab) {
+        // Navigate existing tab to the root (starts a new chat)
+        await chrome.tabs.update(matchedTab.id, { url: baseUrl, active: false });
+        tab = matchedTab;
+        await waitTabLoaded(tab.id);
+        await sleep(3000); // Wait for the new chat interface to initialize
+      } else {
+        tab = await getOrCreateProviderTab(provider);
+      }
+      await storage.appendLog('info', `Session action 'new_chat' — navigated to ${baseUrl}`);
+
+    } else if (action === 'resume_chat' && conversation_url) {
+      // Navigate directly to a specific saved conversation URL
+      const existingTabs = await chrome.tabs.query({});
+      const adapter = getAdapter(provider);
+      const matchedTab = existingTabs.find(t => t.url && adapter && adapter.matchesUrl(t.url));
+      if (matchedTab) {
+        await chrome.tabs.update(matchedTab.id, { url: conversation_url, active: false });
+        tab = matchedTab;
+        await waitTabLoaded(tab.id);
+        await sleep(3000); // Wait for the conversation to load
+      } else {
+        // Open a new tab directly to the conversation URL
+        tab = await chrome.tabs.create({ url: conversation_url, active: false });
+        await waitTabLoaded(tab.id);
+        await sleep(3500);
+      }
+      await storage.appendLog('info', `Session action 'resume_chat' — navigated to ${conversation_url}`);
+
+    } else {
+      // Default 'continue': find or create the provider tab as normal
+      tab = await getOrCreateProviderTab(provider);
+    }
+
+    currentTaskMap.set(task_id, { providerKey: provider, tabId: tab.id, session_id });
+    await storage.updateTask(task_id, { status: 'typing' });
+
+    // Give Chrome a short pause to awaken the tab and ensure content scripts are active
+    await sleep(1500);
+
+    // Inject and send prompting command to content script
+    try {
+      await chrome.tabs.sendMessage(tab.id, {
+        type: 'SUBMIT_PROMPT',
+        taskId: task_id,
+        prompt: fullPrompt,
+        provider: provider,
+      });
+    } catch (sendErr) {
+      if (sendErr.message && sendErr.message.includes('Receiving end does not exist')) {
+        await storage.appendLog('warn', `Content script inactive on tab ${tab.id}. Triggering self-healing reload...`);
+
+        // Reload the tab programmatically
+        await chrome.tabs.reload(tab.id);
+        await waitTabLoaded(tab.id);
+
+        // Wait 3.5 seconds for all content scripts to fully inject and initialize
+        await sleep(3500);
+
+        // Retry sending the prompting command
+        await chrome.tabs.sendMessage(tab.id, {
+          type: 'SUBMIT_PROMPT',
+          taskId: task_id,
+          prompt: fullPrompt,
+          provider: provider,
+        });
+      } else {
+        throw sendErr;
+      }
+    }
+
+  } catch (err) {
+    await storage.appendLog('error', `Task ${task_id} failed: ${err.message}`);
+    await reportError(task_id, err.message);
+  }
+}
+
+// ─── Tab Management ──────────────────────────────────────────────────────────
+async function getOrCreateProviderTab(providerKey) {
+  const adapter = getAdapter(providerKey);
+  if (!adapter) {
+    throw new Error(`Provider adapter '${providerKey}' is not supported.`);
+  }
+
+  const tabs = await chrome.tabs.query({});
+  let matchedTab = tabs.find(t => t.url && adapter.matchesUrl(t.url));
+
+  if (matchedTab) {
+    // If tab is found, update its tabId reference in local storage
+    await storage.updateProvider(providerKey, { tabId: matchedTab.id, status: 'healthy' });
+    return matchedTab;
+  }
+
+  // Need to open a new tab
+  await storage.appendLog('info', `Opening new tab for ${adapter.name}...`);
+  const targetUrl = `https://${adapter.urlPatterns[0]}`;
+  const newTab = await chrome.tabs.create({ url: targetUrl, active: false });
+  
+  await storage.updateProvider(providerKey, { tabId: newTab.id, status: 'healthy' });
+  await waitTabLoaded(newTab.id);
+  
+  // Extra pause for JS to initialize in the loaded page
+  await sleep(3000);
+  return newTab;
+}
+
+function waitTabLoaded(tabId) {
+  return new Promise((resolve) => {
+    function listener(id, info) {
+      if (id === tabId && info.status === 'complete') {
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    }
+    chrome.tabs.onUpdated.addListener(listener);
+    // Safety check
+    chrome.tabs.get(tabId, (tab) => {
+      if (tab && tab.status === 'complete') {
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      }
+    });
+  });
+}
+
+// ─── Messaging & Responses ───────────────────────────────────────────────────
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  const { type, taskId, chunk, error, provider } = message;
+
+  if (type === 'CHUNK') {
+    handleResponseChunk(taskId, chunk);
+  } else if (type === 'COMPLETE') {
+    handleTaskComplete(taskId);
+  } else if (type === 'ERROR') {
+    handleTaskError(taskId, error);
+  } else if (type === 'TAB_LOG') {
+    storage.appendLog('info', `[${provider}] ${message.message}`);
+  } else if (type === 'FORCE_RECONNECT') {
+    connectToServer();
+  }
+
+  // Keep message channel open for async responses
+  return true;
+});
+
+async function handleResponseChunk(taskId, chunk) {
+  await storage.updateTask(taskId, { status: 'streaming' });
+  const state = await storage.getState();
+  if (!state.hfSpaceUrl) return;
+
+  const secret = state.apiKey || 'nancy-ext-dev-secret';
+  const url = `${state.hfSpaceUrl.replace(/\/$/, '')}/ext/response`;
+
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${secret}`,
+      },
+      body: JSON.stringify({
+        task_id: taskId,
+        chunk: chunk,
+        is_done: false,
+      }),
+    });
+  } catch (err) {
+    logger(`Failed to relay chunk: ${err.message}`);
+  }
+}
+
+async function handleTaskComplete(taskId) {
+  await storage.updateTask(taskId, { status: 'done' });
+  setTimeout(() => storage.removeTask(taskId), 5000); // Auto remove after 5s
+
+  const state = await storage.getState();
+  if (!state.hfSpaceUrl) return;
+
+  const secret = state.apiKey || 'nancy-ext-dev-secret';
+  const url = `${state.hfSpaceUrl.replace(/\/$/, '')}/ext/response`;
+
+  // Capture current tab URL for session persistence
+  let conversationUrl = null;
+  const taskMeta = currentTaskMap.get(taskId);
+  if (taskMeta && taskMeta.tabId) {
+    try {
+      const tab = await chrome.tabs.get(taskMeta.tabId);
+      conversationUrl = tab?.url || null;
+    } catch {
+      // Tab might have been closed — not critical
+    }
+  }
+
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${secret}`,
+      },
+      body: JSON.stringify({
+        task_id: taskId,
+        chunk: '',
+        is_done: true,
+        conversation_url: conversationUrl, // Report back for session persistence
+      }),
+    });
+    await storage.appendLog('info', `Task ${taskId} completed. URL: ${conversationUrl || 'unknown'}`);
+  } catch (err) {
+    logger(`Failed to complete task on server: ${err.message}`);
+  } finally {
+    currentTaskMap.delete(taskId);
+  }
+}
+
+
+async function handleTaskError(taskId, errorMsg) {
+  await storage.updateTask(taskId, { status: 'error' });
+  await storage.appendLog('error', `Task ${taskId} error: ${errorMsg}`);
+  await reportError(taskId, errorMsg);
+}
+
+async function reportError(taskId, errorMsg) {
+  const state = await storage.getState();
+  if (!state.hfSpaceUrl) return;
+
+  const secret = state.apiKey || 'nancy-ext-dev-secret';
+  const url = `${state.hfSpaceUrl.replace(/\/$/, '')}/ext/response`;
+
+  try {
+    await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${secret}`,
+      },
+      body: JSON.stringify({
+        task_id: taskId,
+        error: errorMsg,
+        is_done: false,
+      }),
+    });
+  } catch (err) {
+    logger(`Failed to send error state: ${err.message}`);
+  } finally {
+    currentTaskMap.delete(taskId);
+    setTimeout(() => storage.removeTask(taskId), 10000); // Clear from UI in 10s
+  }
+}
+
+
+
+============================================================
+FILE: extension/content-scripts/isolated-observer.js
+============================================================
+/**
+ * @fileoverview DOM Observer content script (ISOLATED world).
+ * Orchestrates:
+ *  - Finding page input & submit fields
+ *  - Triggering input-simulator typing
+ *  - Observing responses via SSE postMessage bridge (Primary) or MutationObserver delta scraping (Fallback)
+ */
+
+(function () {
+  'use strict';
+
+  let currentTaskId = null;
+  let currentProvider = null;
+  let activeObserver = null;
+  let lastResponseLength = 0;
+  let completionTimeout = null;
+
+  const PROVIDERS = {
+    chatgpt: {
+      name: 'ChatGPT',
+      input: ['#prompt-textarea', 'div[contenteditable="true"][id="prompt-textarea"]', '[contenteditable="true"]'],
+      submit: ['button[data-testid="send-button"]', 'button[data-testid="fruitjuice-send-button"]', 'button[aria-label="Send prompt"]', '#composer-background button[aria-label]'],
+      response: '[data-message-author-role="assistant"]',
+      streaming: '.result-streaming, [class*="result-streaming"], button[aria-label="Stop generating"]',
+    },
+    gemini: {
+      name: 'Gemini',
+      input: ['div[contenteditable="true"][aria-label="Prompt"]', 'textarea', '[contenteditable="true"]'],
+      submit: ['button[aria-label="Send message"]', 'button[class*="send"]', 'div[aria-label="Send message"] button'],
+      response: '.message-content, [data-message-author-role="assistant"], div.model-response',
+      streaming: '.generating, .streaming, [class*="generating"]',
+    },
+    deepseek: {
+      name: 'DeepSeek',
+      input: ['textarea', '#chat-input', '[contenteditable="true"]'],
+      submit: ['button[aria-label="Send message"]', 'div[class*="send-button"]', 'button[class*="send"]'],
+      response: 'div[class*="assistant-message"]',
+      streaming: 'div[class*="streaming"], div[class*="loading"]',
+    },
+    kimi: {
+      name: 'Kimi',
+      input: ['[contenteditable="true"]', 'textarea'],
+      submit: ['button[class*="send"]', 'button[type="submit"]'],
+      response: 'div[class*="assistant"]',
+      streaming: '.streaming-indicator, [class*="streaming"]',
+    },
+    claude: {
+      name: 'Claude',
+      input: ['[contenteditable="true"]', 'textarea'],
+      submit: ['button[aria-label="Send Message"]', 'button[class*="send"]'],
+      response: 'div[class*="assistant-message"]',
+      streaming: '.generating, [class*="generating"]',
+    },
+    nim: {
+      name: 'NVIDIA NIM',
+      input: ['textarea[placeholder*="message"]', 'textarea[placeholder*="Message"]', 'textarea[data-testid="chat-input"]', 'textarea'],
+      submit: ['button[aria-label="Send"]', 'button[aria-label="Send message"]', 'button[type="submit"]', 'form button:last-child'],
+      response: 'div[data-role="assistant"], div[class*="assistant"], div[class*="message"][class*="response"]',
+      streaming: '[class*="streaming"], [class*="loading"], [class*="generating"]',
+    },
+    zai: {
+      name: 'z.ai',
+      input: ['div[contenteditable="true"][data-placeholder]', 'div[contenteditable="true"]', 'textarea'],
+      submit: ['button[aria-label="Send"]', 'button[aria-label="Send message"]', 'button[class*="send"]', 'button[type="submit"]'],
+      response: 'div[data-role="assistant"], div[class*="assistant-message"], div[class*="ai-message"], div[class*="bot-message"]',
+      streaming: '[class*="streaming"], [class*="loading"], [class*="typing"]',
+    },
+  };
+
+  function detectProvider() {
+    const host = window.location.hostname;
+    if (host.includes('openai.com') || host.includes('chatgpt.com')) return 'chatgpt';
+    if (host.includes('gemini.google.com')) return 'gemini';
+    if (host.includes('deepseek.com')) return 'deepseek';
+    if (host.includes('kimi.moonshot.cn')) return 'kimi';
+    if (host.includes('claude.ai')) return 'claude';
+    if (host.includes('build.nvidia.com') || host.includes('nim.developer.nvidia.com')) return 'nim';
+    if (host.includes('z.ai') || host.includes('chat.z.ai')) return 'zai';
+    return null;
+  }
+
+  function getSelectors(providerKey) {
+    return PROVIDERS[providerKey || detectProvider()];
+  }
+
+  function findElement(selectors) {
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el) return el;
+    }
+    return null;
+  }
+
+  function log(msg) {
+    chrome.runtime.sendMessage({
+      type: 'TAB_LOG',
+      provider: currentProvider || detectProvider() || 'unknown',
+      message: msg,
+    });
+  }
+
+  // ─── PostMessage bridge (Primary - SSE interception) ────────────────────────
+  window.addEventListener('message', (event) => {
+    if (event.data && event.data.type === 'NANCY_CHUNK') {
+      const { chunk, taskId } = event.data;
+      if (taskId === currentTaskId) {
+        // Clear DOM fallback completion timeouts
+        if (completionTimeout) clearTimeout(completionTimeout);
+        
+        chrome.runtime.sendMessage({
+          type: 'CHUNK',
+          taskId: taskId,
+          chunk: chunk,
+        });
+
+        // Trigger done signal if main-interceptor flags it
+        if (event.data.isDone) {
+          log('SSE stream completion intercepted.');
+          chrome.runtime.sendMessage({
+            type: 'COMPLETE',
+            taskId: taskId,
+          });
+          cleanupTaskState();
+        }
+      }
+    }
+  });
+
+  // ─── Service Worker Command Listener ───────────────────────────────────────
+  chrome.runtime.onMessage.addListener(async (message, sender, sendResponse) => {
+    if (message.type === 'SUBMIT_PROMPT') {
+      const { taskId, prompt, provider } = message;
+      currentTaskId = taskId;
+      currentProvider = provider;
+      lastResponseLength = 0;
+
+      log(`Beginning prompt simulation. TaskId: ${taskId}`);
+
+      try {
+        const config = getSelectors(provider);
+        if (!config) throw new Error(`Provider config not found for ${provider}`);
+
+        const inputEl = findElement(config.input);
+        if (!inputEl) throw new Error(`Could not locate prompt input element.`);
+
+        // 1. Notify main-interceptor of the active taskId
+        window.postMessage({ type: 'NANCY_SET_TASK_ID', taskId }, '*');
+
+        // 2. Human typing simulation
+        await window.NancyInputSimulator.typePrompt(inputEl, prompt);
+        log('Keystroke simulation complete.');
+
+        // 3. Locate submit button (do this AFTER typing so it is guaranteed to be rendered)
+        const submitBtn = findElement(config.submit);
+        if (!submitBtn) throw new Error(`Could not locate send button.`);
+
+        // 4. Submit click
+        submitBtn.click();
+        log('Send button clicked.');
+
+        // 4. Start DOM observer fallback
+        startDOMObserver(config);
+
+      } catch (err) {
+        log(`Error: ${err.message}`);
+        chrome.runtime.sendMessage({
+          type: 'ERROR',
+          taskId: taskId,
+          error: err.message,
+        });
+        cleanupTaskState();
+      }
+    }
+    return true;
+  });
+
+  // ─── Fallback DOM Mutation Observer ─────────────────────────────────────────
+  function startDOMObserver(config) {
+    if (activeObserver) activeObserver.disconnect();
+    if (completionTimeout) clearTimeout(completionTimeout);
+
+    const observer = new MutationObserver(() => {
+      handleDOMMutation(config);
+    });
+
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+
+    activeObserver = observer;
+    log('DOM MutationObserver fallback active.');
+
+    // Schedule safety completion timeout (if no activity for 20 seconds)
+    resetCompletionTimeout();
+  }
+
+  function handleDOMMutation(config) {
+    const allResponses = document.querySelectorAll(config.response);
+    if (allResponses.length === 0) return;
+
+    const lastResponse = allResponses[allResponses.length - 1];
+    
+    // Extract innerText from markdown node or container
+    const markdownNode = lastResponse.querySelector('.markdown, [class*="markdown"]') || lastResponse;
+    const currentText = markdownNode.innerText || markdownNode.textContent || '';
+    
+    const delta = currentText.substr(lastResponseLength);
+    
+    if (delta.length > 0) {
+      resetCompletionTimeout();
+
+      // Send chunk delta
+      chrome.runtime.sendMessage({
+        type: 'CHUNK',
+        taskId: currentTaskId,
+        chunk: delta,
+      });
+
+      lastResponseLength = currentText.length;
+    }
+
+    // Check if streaming indicator has disappeared
+    const isStreamingActive = document.querySelector(config.streaming) !== null;
+    if (!isStreamingActive && lastResponseLength > 0) {
+      // Debounce complete to allow DOM state to settle
+      if (completionTimeout) clearTimeout(completionTimeout);
+      completionTimeout = setTimeout(() => {
+        log('DOM observation complete (class settled).');
+        chrome.runtime.sendMessage({
+          type: 'COMPLETE',
+          taskId: currentTaskId,
+        });
+        cleanupTaskState();
+      }, 1000);
+    }
+  }
+
+  function resetCompletionTimeout() {
+    if (completionTimeout) clearTimeout(completionTimeout);
+    completionTimeout = setTimeout(() => {
+      log('DOM observation complete (inactivity timeout).');
+      chrome.runtime.sendMessage({
+        type: 'COMPLETE',
+        taskId: currentTaskId,
+      });
+      cleanupTaskState();
+    }, 20000); // 20 seconds of no changes -> complete
+  }
+
+  function cleanupTaskState() {
+    if (activeObserver) {
+      activeObserver.disconnect();
+      activeObserver = null;
+    }
+    if (completionTimeout) {
+      clearTimeout(completionTimeout);
+      completionTimeout = null;
+    }
+    currentTaskId = null;
+    lastResponseLength = 0;
+  }
+})();
+
+
+
+============================================================
+FILE: extension/content-scripts/main-interceptor.js
+============================================================
+/**
+ * @fileoverview Fetch Interceptor content script (MAIN world).
+ * Monkey-patches window.fetch to intercept raw API streams directly,
+ * parsing SSE chunks for instant delta transmission, bypassed DOM delay.
+ */
+
+(function () {
+  'use strict';
+
+  let activeTaskId = null;
+  let chatgptLastLength = 0;
+
+  // Listen for the isolated observer setting the active Task ID
+  window.addEventListener('message', (event) => {
+    if (event.data && event.data.type === 'NANCY_SET_TASK_ID') {
+      activeTaskId = event.data.taskId;
+      chatgptLastLength = 0; // Reset length for the new stream
+    }
+  });
+
+  const TARGET_PATTERNS = [
+    '/backend-api/conversation', // ChatGPT
+    '/api/v0/chat/completion',    // DeepSeek
+    '/api/chat/v2/completion',    // Kimi
+    '/api/v1/chat/completions',   // Claude
+    '/v1/chat/completions',       // NIM Portal & z.ai (OpenAI-compatible)
+    '/api/chat',                  // z.ai alternative
+  ];
+
+  function isTargetUrl(url) {
+    return TARGET_PATTERNS.some(pattern => url.includes(pattern));
+  }
+
+  function detectProvider(url) {
+    if (url.includes('openai.com') || url.includes('chatgpt.com')) return 'chatgpt';
+    if (url.includes('deepseek.com')) return 'deepseek';
+    if (url.includes('kimi.moonshot.cn')) return 'kimi';
+    if (url.includes('claude.ai')) return 'claude';
+    if (url.includes('build.nvidia.com') || url.includes('nim.developer.nvidia.com')) return 'nim';
+    if (url.includes('z.ai')) return 'zai';
+    return null;
+  }
+
+  // ─── JSON Chunk Parsers ───────────────────────────────────────────────────
+  function parseChatGPTChunk(json) {
+    const parts = json?.message?.content?.parts;
+    if (Array.isArray(parts) && parts.length > 0) {
+      const fullText = parts[parts.length - 1];
+      if (typeof fullText === 'string') {
+        const delta = fullText.substring(chatgptLastLength);
+        chatgptLastLength = fullText.length;
+        return delta;
+      }
+    }
+    return null;
+  }
+
+  function parseDeepSeekChunk(json) {
+    return json?.choices?.[0]?.delta?.content || null;
+  }
+
+  function parseKimiChunk(json) {
+    return json?.choices?.[0]?.delta?.content || null;
+  }
+
+  function parseClaudeChunk(json) {
+    // Claude MV3 format delta
+    if (json?.type === 'content_block_delta') {
+      return json?.delta?.text || null;
+    }
+    return json?.completion || null; // Fallback to classic
+  }
+
+  function parseOpenAICompatibleChunk(json) {
+    // Standard OpenAI streaming format - used by NIM, z.ai, and many others
+    return json?.choices?.[0]?.delta?.content || null;
+  }
+
+  function extractDelta(line, provider) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) return null;
+
+    const dataValue = trimmed.substring(5).trim();
+    if (dataValue === '[DONE]') return null;
+
+    try {
+      const json = JSON.parse(dataValue);
+      switch (provider) {
+        case 'chatgpt':
+          return parseChatGPTChunk(json);
+        case 'deepseek':
+          return parseDeepSeekChunk(json);
+        case 'kimi':
+          return parseKimiChunk(json);
+        case 'claude':
+          return parseClaudeChunk(json);
+        case 'nim':
+        case 'zai':
+          return parseOpenAICompatibleChunk(json);
+        default:
+          // Generic OpenAI-compatible fallback
+          return parseOpenAICompatibleChunk(json) || null;
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  // ─── window.fetch Monkey-Patch ─────────────────────────────────────────────
+  const originalFetch = window.fetch;
+  window.fetch = async function (input, init) {
+    const url = typeof input === 'string' ? input : input.url || '';
+    
+    if (activeTaskId && isTargetUrl(url)) {
+      const provider = detectProvider(url);
+
+      try {
+        const response = await originalFetch(input, init);
+        const contentType = response.headers.get('content-type') || '';
+        
+        if (response.body && contentType.includes('event-stream')) {
+          const originalReader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let sseBuffer = '';
+
+          const customStream = new ReadableStream({
+            async start(controller) {
+              try {
+                while (true) {
+                  const { value, done } = await originalReader.read();
+                  if (done) {
+                    controller.close();
+                    // Signal stream completion
+                    window.postMessage({
+                      type: 'NANCY_CHUNK',
+                      taskId: activeTaskId,
+                      chunk: '',
+                      isDone: true,
+                    }, '*');
+                    break;
+                  }
+
+                  // Relay value back to page's original fetch caller
+                  controller.enqueue(value);
+
+                  // Extract text delta chunks for Nancy
+                  const text = decoder.decode(value, { stream: true });
+                  sseBuffer += text;
+
+                  const lines = sseBuffer.split(/\r\n|\r|\n/);
+                  sseBuffer = lines.pop() || ''; // Hold partial line
+
+                  for (const line of lines) {
+                    const delta = extractDelta(line, provider);
+                    if (delta && delta.length > 0) {
+                      window.postMessage({
+                        type: 'NANCY_CHUNK',
+                        taskId: activeTaskId,
+                        chunk: delta,
+                        isDone: false,
+                      }, '*');
+                    }
+                  }
+                }
+              } catch (err) {
+                controller.error(err);
+              }
+            }
+          });
+
+          return new Response(customStream, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers,
+          });
+        }
+
+        return response;
+      } catch (err) {
+        console.error('[Nancy/Interceptor] Fetch interception failed:', err);
+        return originalFetch(input, init);
+      }
+    }
+
+    return originalFetch(input, init);
+  };
+})();
+
+
+
+============================================================
+FILE: extension/content-scripts/input-simulator.js
+============================================================
+/**
+ * @fileoverview Input simulation content script (ISOLATED world).
+ * Simulates human-like typing and prompt submission on chatbot pages.
+ */
+
+(function () {
+  'use strict';
+
+  // Box-Muller transform for Gaussian typing delays
+  function gaussianRandom(mean, stdDev) {
+    let u1 = 0, u2 = 0;
+    while (u1 === 0) u1 = Math.random();
+    while (u2 === 0) u2 = Math.random();
+    const z = Math.sqrt(-2.0 * Math.log(u1)) * Math.cos(2.0 * Math.PI * u2);
+    return mean + z * stdDev;
+  }
+
+  function getCharDelay(char) {
+    let mean = 90;
+    let stdDev = 25;
+
+    if (char === ' ') {
+      mean = 65;
+      stdDev = 15;
+    } else if (/[.!?\n]/.test(char)) {
+      mean = 180;
+      stdDev = 50;
+    } else if (/[A-Z]/.test(char)) {
+      mean = 110;
+      stdDev = 30;
+    }
+
+    const delay = gaussianRandom(mean, stdDev);
+    const clamped = Math.max(30, Math.min(300, delay));
+
+    // 8% chance of a thinking pause
+    if (Math.random() < 0.08) {
+      const pause = 250 + Math.random() * 500;
+      return Math.round(clamped + pause);
+    }
+
+    return Math.round(clamped);
+  }
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /**
+   * Human-like typing simulation into an HTML element.
+   * Works on textarea and ProseMirror contenteditable elements.
+   */
+  async function typePrompt(element, text) {
+    if (!element) throw new Error('Target input element not found.');
+
+    element.focus();
+    await sleep(200);
+
+    // Clear existing text if any
+    if (element.tagName === 'TEXTAREA' || element.tagName === 'INPUT') {
+      element.value = '';
+    } else if (element.getAttribute('contenteditable') === 'true') {
+      element.innerHTML = '';
+    }
+
+    element.dispatchEvent(new Event('focus', { bubbles: true }));
+
+    for (let i = 0; i < text.length; i++) {
+      const char = text[i];
+
+      // Create Keyboard events
+      const keydownEvent = new KeyboardEvent('keydown', {
+        key: char,
+        code: `Key${char.toUpperCase()}`,
+        bubbles: true,
+        cancelable: true,
+      });
+      element.dispatchEvent(keydownEvent);
+
+      // Insert character
+      if (element.tagName === 'TEXTAREA' || element.tagName === 'INPUT') {
+        element.value += char;
+      } else if (element.getAttribute('contenteditable') === 'true') {
+        // Safe document.execCommand for rich text editors
+        document.execCommand('insertText', false, char);
+      }
+
+      // Input event to trigger internal React/Vue state updates
+      const inputEvent = new Event('input', { bubbles: true });
+      element.dispatchEvent(inputEvent);
+
+      const keyupEvent = new KeyboardEvent('keyup', {
+        key: char,
+        code: `Key${char.toUpperCase()}`,
+        bubbles: true,
+        cancelable: true,
+      });
+      element.dispatchEvent(keyupEvent);
+
+      // Human-like typing cadence delay
+      await sleep(getCharDelay(char));
+    }
+
+    // Trigger blur/change events to finalize react state updates
+    element.dispatchEvent(new Event('change', { bubbles: true }));
+    await sleep(100);
+  }
+
+  // Export to global scope
+  window.NancyInputSimulator = {
+    typePrompt,
+    sleep,
+  };
+})();
+
+
+
+============================================================
+FILE: extension/adapters/base.js
+============================================================
+/**
+ * @fileoverview Base adapter interface and provider registry.
+ * Each provider adapter defines selectors, URL patterns, and
+ * parsing logic specific to its chatbot UI.
+ * @module adapters/base
+ */
+
+/**
+ * @typedef {Object} AdapterConfig
+ * @property {string}   key             - Internal provider key (e.g. "chatgpt").
+ * @property {string}   name            - Human-readable name.
+ * @property {string[]} urlPatterns     - URL patterns to match this provider.
+ * @property {string[]} inputSelectors  - CSS selectors for the input field (tried in order).
+ * @property {string[]} submitSelectors - CSS selectors for the submit/send button.
+ * @property {string}   responseSelector - CSS selector for the last assistant response.
+ * @property {string}   streamingIndicator - CSS selector/class indicating streaming in progress.
+ * @property {string[]} fetchPatterns   - URL substrings to match API fetch calls.
+ * @property {function(object): string|null} extractContent - Extract text content from a parsed SSE JSON chunk.
+ * @property {function(Element): string} extractResponseText - Extract response text from a DOM element.
+ */
+
+/**
+ * Base adapter with sensible defaults. Provider-specific adapters
+ * override the fields they need.
+ */
+export class BaseAdapter {
+  /** @returns {string} */
+  get key() { return 'unknown'; }
+
+  /** @returns {string} */
+  get name() { return 'Unknown Provider'; }
+
+  /** @returns {string[]} */
+  get urlPatterns() { return []; }
+
+  /** @returns {string[]} */
+  get inputSelectors() { return ['textarea', '[contenteditable="true"]']; }
+
+  /** @returns {string[]} */
+  get submitSelectors() { return ['button[type="submit"]']; }
+
+  /** @returns {string} */
+  get responseSelector() { return ''; }
+
+  /** @returns {string} */
+  get streamingIndicator() { return ''; }
+
+  /** @returns {string[]} */
+  get fetchPatterns() { return []; }
+
+  /**
+   * Extract content delta from a parsed SSE JSON chunk.
+   * Override in provider adapters.
+   * @param {object} json - Parsed JSON from SSE data field.
+   * @returns {string|null} Content text or null if not a content chunk.
+   */
+  extractContent(json) {
+    return null;
+  }
+
+  /**
+   * Extract the full response text from a DOM element.
+   * @param {Element} el - The response container element.
+   * @returns {string} Extracted text.
+   */
+  extractResponseText(el) {
+    if (!el) return '';
+    // Default: use innerText for clean text extraction
+    return el.innerText?.trim() ?? el.textContent?.trim() ?? '';
+  }
+
+  /**
+   * Check if a URL matches this provider.
+   * @param {string} url - The page URL to test.
+   * @returns {boolean}
+   */
+  matchesUrl(url) {
+    return this.urlPatterns.some(pattern => url.includes(pattern));
+  }
+
+  /**
+   * Check if a fetch URL matches this provider's API patterns.
+   * @param {string} fetchUrl - The fetch request URL.
+   * @returns {boolean}
+   */
+  matchesFetch(fetchUrl) {
+    return this.fetchPatterns.some(pattern => fetchUrl.includes(pattern));
+  }
+
+  /**
+   * Find the input element on the page.
+   * @returns {Element|null}
+   */
+  findInput() {
+    for (const sel of this.inputSelectors) {
+      const el = document.querySelector(sel);
+      if (el) return el;
+    }
+    return null;
+  }
+
+  /**
+   * Find the submit button on the page.
+   * @returns {Element|null}
+   */
+  findSubmitButton() {
+    for (const sel of this.submitSelectors) {
+      const el = document.querySelector(sel);
+      if (el) return el;
+    }
+    return null;
+  }
+
+  /**
+   * Find the last assistant response element.
+   * @returns {Element|null}
+   */
+  findLastResponse() {
+    if (!this.responseSelector) return null;
+    const all = document.querySelectorAll(this.responseSelector);
+    return all.length > 0 ? all[all.length - 1] : null;
+  }
+
+  /**
+   * Check if the chatbot is currently streaming a response.
+   * @returns {boolean}
+   */
+  isStreaming() {
+    if (!this.streamingIndicator) return false;
+    return document.querySelector(this.streamingIndicator) !== null;
+  }
+}
+
+// ─── Provider Registry ────────────────────────────────────────────
+
+/** @type {Map<string, BaseAdapter>} */
+const registry = new Map();
+
+/**
+ * Register a provider adapter.
+ * @param {BaseAdapter} adapter - Adapter instance to register.
+ */
+export function registerAdapter(adapter) {
+  registry.set(adapter.key, adapter);
+}
+
+/**
+ * Get an adapter by its key.
+ * @param {string} key - Provider key.
+ * @returns {BaseAdapter|undefined}
+ */
+export function getAdapter(key) {
+  return registry.get(key);
+}
+
+/**
+ * Find the adapter that matches a given page URL.
+ * @param {string} url - The page URL.
+ * @returns {BaseAdapter|undefined}
+ */
+export function getAdapterForUrl(url) {
+  for (const adapter of registry.values()) {
+    if (adapter.matchesUrl(url)) return adapter;
+  }
+  return undefined;
+}
+
+/**
+ * Find the adapter whose fetch patterns match a given API URL.
+ * @param {string} fetchUrl - The fetch request URL.
+ * @returns {BaseAdapter|undefined}
+ */
+export function getAdapterForFetch(fetchUrl) {
+  for (const adapter of registry.values()) {
+    if (adapter.matchesFetch(fetchUrl)) return adapter;
+  }
+  return undefined;
+}
+
+/**
+ * Get all registered adapters.
+ * @returns {BaseAdapter[]}
+ */
+export function getAllAdapters() {
+  return [...registry.values()];
+}
+
+/**
+ * Get all registered provider keys.
+ * @returns {string[]}
+ */
+export function getAllProviderKeys() {
+  return [...registry.keys()];
+}
+
+
+
+============================================================
+FILE: extension/adapters/chatgpt.js
+============================================================
+/**
+ * @fileoverview ChatGPT provider adapter.
+ * Defines selectors, fetch patterns, and parsing logic
+ * specific to the ChatGPT web UI (chat.openai.com / chatgpt.com).
+ * @module adapters/chatgpt
+ */
+
+import { BaseAdapter, registerAdapter } from './base.js';
+
+/**
+ * ChatGPT adapter for the OpenAI web interface.
+ * @extends BaseAdapter
+ */
+class ChatGPTAdapter extends BaseAdapter {
+  /** @returns {string} */
+  get key() { return 'chatgpt'; }
+
+  /** @returns {string} */
+  get name() { return 'ChatGPT'; }
+
+  /** @returns {string[]} */
+  get urlPatterns() {
+    return [
+      'chat.openai.com',
+      'chatgpt.com',
+    ];
+  }
+
+  /**
+   * Input selectors tried in priority order.
+   * ChatGPT has changed its input element several times:
+   * - #prompt-textarea (classic textarea)
+   * - div#prompt-textarea[contenteditable] (newer ProseMirror-based)
+   * - [contenteditable="true"] (fallback)
+   * @returns {string[]}
+   */
+  get inputSelectors() {
+    return [
+      '#prompt-textarea',
+      'div[contenteditable="true"][id="prompt-textarea"]',
+      'textarea[data-id="root"]',
+      '[contenteditable="true"]',
+    ];
+  }
+
+  /**
+   * Submit button selectors.
+   * ChatGPT uses data-testid on the send button, but it changes.
+   * @returns {string[]}
+   */
+  get submitSelectors() {
+    return [
+      'button[data-testid="send-button"]',
+      'button[data-testid="fruitjuice-send-button"]',
+      'button[aria-label="Send prompt"]',
+      'form button[class*="bottom"]',
+      // Fallback: look for the button near the textarea
+      '#prompt-textarea ~ button',
+      '#composer-background button[aria-label]',
+    ];
+  }
+
+  /**
+   * Selector for assistant response containers.
+   * We want the last one on the page.
+   * @returns {string}
+   */
+  get responseSelector() {
+    return [
+      '[data-message-author-role="assistant"]',
+      'div[class*="markdown"]',
+    ].join(', ');
+  }
+
+  /**
+   * Streaming indicator — present while ChatGPT is still generating.
+   * @returns {string}
+   */
+  get streamingIndicator() {
+    return '.result-streaming, [class*="result-streaming"]';
+  }
+
+  /**
+   * URL patterns for ChatGPT's conversation API endpoint.
+   * @returns {string[]}
+   */
+  get fetchPatterns() {
+    return [
+      '/backend-api/conversation',
+    ];
+  }
+
+  /**
+   * Extract content delta from a ChatGPT SSE JSON chunk.
+   *
+   * ChatGPT SSE format (simplified):
+   * ```json
+   * {
+   *   "message": {
+   *     "content": {
+   *       "parts": ["Hello, how can I help?"],
+   *       "content_type": "text"
+   *     },
+   *     "author": { "role": "assistant" },
+   *     "status": "in_progress"
+   *   }
+   * }
+   * ```
+   *
+   * We extract the last part from message.content.parts.
+   *
+   * @param {object} json - Parsed JSON from SSE data line.
+   * @returns {string|null} Extracted text content or null.
+   */
+  extractContent(json) {
+    try {
+      // Handle the standard conversation SSE format
+      const message = json?.message;
+      if (!message) return null;
+
+      // Only extract from assistant messages
+      const role = message?.author?.role;
+      if (role !== 'assistant') return null;
+
+      // Skip non-text content
+      const contentType = message?.content?.content_type;
+      if (contentType !== 'text') return null;
+
+      const parts = message?.content?.parts;
+      if (!Array.isArray(parts) || parts.length === 0) return null;
+
+      // Return the full accumulated text (last part)
+      const text = parts[parts.length - 1];
+      return typeof text === 'string' ? text : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Extract response text from a ChatGPT response DOM element.
+   * Handles the markdown rendering container.
+   * @param {Element} el - The response container element.
+   * @returns {string} Extracted text.
+   */
+  extractResponseText(el) {
+    if (!el) return '';
+
+    // Try to find the markdown container within the response
+    const markdownEl = el.querySelector('.markdown, [class*="markdown"]');
+    const target = markdownEl || el;
+
+    // Use innerText for cleaner output (respects CSS display)
+    return target.innerText?.trim() ?? target.textContent?.trim() ?? '';
+  }
+
+  /**
+   * Find the last assistant response element specifically for ChatGPT.
+   * Overrides base to handle ChatGPT's DOM structure.
+   * @returns {Element|null}
+   */
+  findLastResponse() {
+    // Primary: data-message-author-role attribute
+    const byRole = document.querySelectorAll('[data-message-author-role="assistant"]');
+    if (byRole.length > 0) {
+      return byRole[byRole.length - 1];
+    }
+
+    // Fallback: look for turn containers
+    const turns = document.querySelectorAll('[data-testid^="conversation-turn"]');
+    if (turns.length > 0) {
+      // Get the last turn that contains assistant content
+      for (let i = turns.length - 1; i >= 0; i--) {
+        const turn = turns[i];
+        if (turn.querySelector('[data-message-author-role="assistant"]') ||
+            turn.querySelector('.markdown')) {
+          return turn;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Check if ChatGPT is currently streaming.
+   * @returns {boolean}
+   */
+  isStreaming() {
+    // Check for the streaming class
+    if (document.querySelector('.result-streaming')) return true;
+
+    // Check for the stop button (visible during generation)
+    const stopBtn = document.querySelector('button[aria-label="Stop generating"]');
+    if (stopBtn) return true;
+
+    return false;
+  }
+}
+
+// ─── Register the adapter ────────────────────────────────────────
+const chatgptAdapter = new ChatGPTAdapter();
+registerAdapter(chatgptAdapter);
+
+export default chatgptAdapter;
+export { ChatGPTAdapter };
+
+
+
+============================================================
+FILE: extension/adapters/gemini.js
+============================================================
+/**
+ * @fileoverview Gemini provider adapter.
+ * @module adapters/gemini
+ */
+
+import { BaseAdapter, registerAdapter } from './base.js';
+
+class GeminiAdapter extends BaseAdapter {
+  get key() { return 'gemini'; }
+  get name() { return 'Gemini'; }
+  get urlPatterns() { return ['gemini.google.com']; }
+  get inputSelectors() {
+    return [
+      'div[contenteditable="true"][aria-label="Prompt"]',
+      'textarea',
+      '[contenteditable="true"]',
+    ];
+  }
+  get submitSelectors() {
+    return [
+      'button[aria-label="Send message"]',
+      'button[class*="send"]',
+      'div[aria-label="Send message"] button',
+    ];
+  }
+  get responseSelector() {
+    return '.message-content, [data-message-author-role="assistant"], div.model-response';
+  }
+  get streamingIndicator() {
+    return '.generating, .streaming, [class*="generating"]';
+  }
+}
+
+const geminiAdapter = new GeminiAdapter();
+registerAdapter(geminiAdapter);
+
+export default geminiAdapter;
+export { GeminiAdapter };
+
+
+
+============================================================
+FILE: extension/adapters/deepseek.js
+============================================================
+/**
+ * @fileoverview DeepSeek provider adapter.
+ * @module adapters/deepseek
+ */
+
+import { BaseAdapter, registerAdapter } from './base.js';
+
+class DeepSeekAdapter extends BaseAdapter {
+  get key() { return 'deepseek'; }
+  get name() { return 'DeepSeek'; }
+  get urlPatterns() { return ['chat.deepseek.com']; }
+  get inputSelectors() {
+    return [
+      'textarea',
+      '#chat-input',
+      '[contenteditable="true"]',
+    ];
+  }
+  get submitSelectors() {
+    return [
+      'button[aria-label="Send message"]',
+      'div[class*="send-button"]',
+      'button[class*="send"]',
+    ];
+  }
+  get responseSelector() {
+    return 'div[class*="assistant-message"]';
+  }
+  get streamingIndicator() {
+    return 'div[class*="streaming"], div[class*="loading"]';
+  }
+}
+
+const deepseekAdapter = new DeepSeekAdapter();
+registerAdapter(deepseekAdapter);
+
+export default deepseekAdapter;
+export { DeepSeekAdapter };
+
+
+
+============================================================
+FILE: extension/adapters/kimi.js
+============================================================
+/**
+ * @fileoverview Kimi provider adapter.
+ * @module adapters/kimi
+ */
+
+import { BaseAdapter, registerAdapter } from './base.js';
+
+class KimiAdapter extends BaseAdapter {
+  get key() { return 'kimi'; }
+  get name() { return 'Kimi'; }
+  get urlPatterns() { return ['kimi.moonshot.cn']; }
+  get inputSelectors() {
+    return [
+      '[contenteditable="true"]',
+      'textarea',
+    ];
+  }
+  get submitSelectors() {
+    return [
+      'button[class*="send"]',
+      'button[type="submit"]',
+    ];
+  }
+  get responseSelector() {
+    return 'div[class*="assistant"]';
+  }
+  get streamingIndicator() {
+    return '.streaming-indicator, [class*="streaming"]';
+  }
+}
+
+const kimiAdapter = new KimiAdapter();
+registerAdapter(kimiAdapter);
+
+export default kimiAdapter;
+export { KimiAdapter };
+
+
+
+============================================================
+FILE: extension/adapters/claude.js
+============================================================
+/**
+ * @fileoverview Claude provider adapter.
+ * @module adapters/claude
+ */
+
+import { BaseAdapter, registerAdapter } from './base.js';
+
+class ClaudeAdapter extends BaseAdapter {
+  get key() { return 'claude'; }
+  get name() { return 'Claude'; }
+  get urlPatterns() { return ['claude.ai']; }
+  get inputSelectors() {
+    return [
+      '[contenteditable="true"]',
+      'textarea',
+    ];
+  }
+  get submitSelectors() {
+    return [
+      'button[aria-label="Send Message"]',
+      'button[class*="send"]',
+    ];
+  }
+  get responseSelector() {
+    return 'div[class*="assistant-message"]';
+  }
+  get streamingIndicator() {
+    return '.generating, [class*="generating"]';
+  }
+}
+
+const claudeAdapter = new ClaudeAdapter();
+registerAdapter(claudeAdapter);
+
+export default claudeAdapter;
+export { ClaudeAdapter };
+
+
+
+============================================================
+FILE: extension/adapters/nim.js
+============================================================
+/**
+ * @fileoverview NVIDIA NIM Portal adapter.
+ * Targets the NVIDIA NIM playground at build.nvidia.com
+ * Defines selectors, fetch patterns, and parsing logic specific to the NIM web UI.
+ * @module adapters/nim
+ */
+
+import { BaseAdapter, registerAdapter } from './base.js';
+
+/**
+ * NVIDIA NIM Portal adapter.
+ * @extends BaseAdapter
+ */
+class NIMAdapter extends BaseAdapter {
+  /** @returns {string} */
+  get key() { return 'nim'; }
+
+  /** @returns {string} */
+  get name() { return 'NVIDIA NIM'; }
+
+  /** @returns {string[]} */
+  get urlPatterns() {
+    return [
+      'build.nvidia.com',
+      'nim.developer.nvidia.com',
+    ];
+  }
+
+  /**
+   * Input selectors in priority order for NIM playground chat input.
+   * NIM uses a standard textarea with a specific placeholder.
+   * @returns {string[]}
+   */
+  get inputSelectors() {
+    return [
+      'textarea[placeholder*="message"]',
+      'textarea[placeholder*="Message"]',
+      'textarea[data-testid="chat-input"]',
+      'div[contenteditable="true"]',
+      'textarea',
+    ];
+  }
+
+  /**
+   * Submit button selectors for NIM playground.
+   * @returns {string[]}
+   */
+  get submitSelectors() {
+    return [
+      'button[aria-label="Send"]',
+      'button[aria-label="Send message"]',
+      'button[type="submit"]',
+      'button[data-testid="send-button"]',
+      // NIM often has an icon button near the textarea
+      'form button:last-child',
+      'div[role="button"][aria-label*="send"]',
+    ];
+  }
+
+  /**
+   * Selector for the NIM assistant response container.
+   * @returns {string}
+   */
+  get responseSelector() {
+    return [
+      'div[data-role="assistant"]',
+      'div[class*="assistant"]',
+      'div[class*="message"][class*="response"]',
+      'div[class*="chat-message"]:last-child',
+    ].join(', ');
+  }
+
+  /**
+   * Streaming indicator — visible while NIM is generating.
+   * @returns {string}
+   */
+  get streamingIndicator() {
+    return '[class*="streaming"], [class*="loading"], [class*="generating"], div[class*="cursor-blink"]';
+  }
+
+  /**
+   * NIM playground internal API fetch patterns.
+   * @returns {string[]}
+   */
+  get fetchPatterns() {
+    return [
+      '/v1/chat/completions',
+      '/api/v1/chat',
+    ];
+  }
+
+  /**
+   * Extract content delta from NIM SSE chunk.
+   * NIM uses the standard OpenAI chunk format since it IS the NIM API.
+   * @param {object} json - Parsed JSON from SSE data line.
+   * @returns {string|null}
+   */
+  extractContent(json) {
+    try {
+      // Standard OpenAI streaming format
+      const content = json?.choices?.[0]?.delta?.content;
+      return typeof content === 'string' ? content : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Extract response text from NIM response DOM element.
+   * @param {Element} el - The response container element.
+   * @returns {string}
+   */
+  extractResponseText(el) {
+    if (!el) return '';
+    const codeEl = el.querySelector('pre, code');
+    if (codeEl) return codeEl.innerText?.trim() ?? '';
+    return el.innerText?.trim() ?? el.textContent?.trim() ?? '';
+  }
+
+  /**
+   * Check if NIM is currently streaming.
+   * @returns {boolean}
+   */
+  isStreaming() {
+    if (document.querySelector('[class*="streaming"], [class*="cursor-blink"]')) return true;
+    // Check if there's a stop button visible
+    const stopBtn = document.querySelector('button[aria-label*="Stop"], button[aria-label*="stop"]');
+    if (stopBtn) return true;
+    return false;
+  }
+}
+
+// ─── Register the adapter ────────────────────────────────────────
+const nimAdapter = new NIMAdapter();
+registerAdapter(nimAdapter);
+
+export default nimAdapter;
+export { NIMAdapter };
+
+
+
+============================================================
+FILE: extension/adapters/zai.js
+============================================================
+/**
+ * @fileoverview z.ai Chat adapter.
+ * Targets the z.ai chat portal at chat.z.ai
+ * Defines selectors, fetch patterns, and parsing logic specific to the z.ai web UI.
+ * @module adapters/zai
+ */
+
+import { BaseAdapter, registerAdapter } from './base.js';
+
+/**
+ * z.ai Chat adapter.
+ * @extends BaseAdapter
+ */
+class ZAIAdapter extends BaseAdapter {
+  /** @returns {string} */
+  get key() { return 'zai'; }
+
+  /** @returns {string} */
+  get name() { return 'z.ai'; }
+
+  /** @returns {string[]} */
+  get urlPatterns() {
+    return [
+      'chat.z.ai',
+      'z.ai/chat',
+      'z.ai',
+    ];
+  }
+
+  /**
+   * Input selectors in priority order for z.ai chat interface.
+   * z.ai uses a contenteditable div similar to Kimi/Claude.
+   * @returns {string[]}
+   */
+  get inputSelectors() {
+    return [
+      'div[contenteditable="true"][data-placeholder]',
+      'div[contenteditable="true"][aria-label*="message"]',
+      'div[contenteditable="true"][aria-label*="Message"]',
+      'textarea[placeholder*="message"]',
+      'textarea[placeholder*="Message"]',
+      '[contenteditable="true"]',
+      'textarea',
+    ];
+  }
+
+  /**
+   * Submit button selectors for z.ai.
+   * @returns {string[]}
+   */
+  get submitSelectors() {
+    return [
+      'button[aria-label="Send"]',
+      'button[aria-label="Send message"]',
+      'button[aria-label="发送"]',  // Chinese: "Send"
+      'button[data-testid="send-button"]',
+      'button[type="submit"]',
+      'button[class*="send"]',
+      'div[class*="send-button"]',
+      'span[class*="send"]',
+    ];
+  }
+
+  /**
+   * Selector for z.ai assistant response container.
+   * @returns {string}
+   */
+  get responseSelector() {
+    return [
+      'div[data-role="assistant"]',
+      'div[class*="assistant-message"]',
+      'div[class*="ai-message"]',
+      'div[class*="bot-message"]',
+      'div[class*="message"][class*="assistant"]',
+    ].join(', ');
+  }
+
+  /**
+   * Streaming indicator for z.ai.
+   * @returns {string}
+   */
+  get streamingIndicator() {
+    return '[class*="streaming"], [class*="loading"], [class*="generating"], [class*="typing"]';
+  }
+
+  /**
+   * z.ai internal API fetch patterns.
+   * @returns {string[]}
+   */
+  get fetchPatterns() {
+    return [
+      '/v1/chat/completions',
+      '/api/chat',
+      '/chat/completions',
+    ];
+  }
+
+  /**
+   * Extract content delta from z.ai SSE chunk.
+   * z.ai uses the standard OpenAI streaming format.
+   * @param {object} json - Parsed JSON from SSE data line.
+   * @returns {string|null}
+   */
+  extractContent(json) {
+    try {
+      // Try standard OpenAI format first
+      const content = json?.choices?.[0]?.delta?.content;
+      if (typeof content === 'string') return content;
+      // Fallback to direct text field
+      return json?.text || json?.content || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Extract response text from z.ai DOM element.
+   * @param {Element} el - The response container element.
+   * @returns {string}
+   */
+  extractResponseText(el) {
+    if (!el) return '';
+    const markdownEl = el.querySelector('.markdown, [class*="markdown"], [class*="content"]');
+    const target = markdownEl || el;
+    return target.innerText?.trim() ?? target.textContent?.trim() ?? '';
+  }
+
+  /**
+   * Check if z.ai is currently streaming.
+   * @returns {boolean}
+   */
+  isStreaming() {
+    if (document.querySelector('[class*="streaming"], [class*="typing-indicator"]')) return true;
+    const stopBtn = document.querySelector('button[aria-label*="Stop"], button[aria-label*="stop"], button[aria-label*="停止"]');
+    if (stopBtn) return true;
+    return false;
+  }
+}
+
+// ─── Register the adapter ────────────────────────────────────────
+const zaiAdapter = new ZAIAdapter();
+registerAdapter(zaiAdapter);
+
+export default zaiAdapter;
+export { ZAIAdapter };
+
+
+
+============================================================
+FILE: hf-space/main.py
+============================================================
+"""
+Nancy HF Space — FastAPI Main Entry Point.
+
+Initializes the FastAPI application, registers routers (API, Extension, Health),
+manages startup/shutdown hooks (Redis, logging), and configures CORS middleware.
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from config import settings
+from core.redis_client import redis_client
+from models.openai import ErrorDetail, ErrorResponse
+from routers.api import router as api_router
+from routers.extension import router as extension_router
+from routers.health import router as health_router
+from routers.sessions import router as sessions_router
+from routers.admin import router as admin_router
+
+# ── Logging Configuration ─────────────────────────────────────────────────────
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    format="%(asctime)s | %(levelname)-8s | %(name)s:%(funcName)s:%(lineno)d - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("nancy.main")
+
+
+# ── Lifespan Context Manager ──────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handles startup and shutdown hooks for Nancy."""
+    logger.info("Initializing Nancy HF Space backend...")
+
+    # Startup Upstash Redis if configured
+    await redis_client.startup()
+
+    yield
+
+    logger.info("Shutting down Nancy HF Space backend...")
+    # Shutdown Upstash Redis
+    await redis_client.shutdown()
+
+
+# ── FastAPI App Initialization ────────────────────────────────────────────────
+app = FastAPI(
+    title="Nancy",
+    description="Free Chatbot to OpenAI-Compatible API Orchestrator",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+# ── CORS Middleware ───────────────────────────────────────────────────────────
+# Allow access from Chrome extension environment (chrome-extension://*)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Router Registration ───────────────────────────────────────────────────────
+app.include_router(health_router)
+app.include_router(extension_router)
+app.include_router(api_router)
+app.include_router(sessions_router)
+app.include_router(admin_router)
+
+
+# ── Global Exception Handlers ─────────────────────────────────────────────────
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catch-all standard OpenAI-compatible error response for internal errors."""
+    logger.error("Unhandled error at %s: %s", request.url.path, exc, exc_info=True)
+    error_detail = ErrorDetail(
+        message=f"Nancy server internal error: {str(exc)}",
+        type="internal_server_error",
+        code="500",
+    )
+    return JSONResponse(
+        status_code=500,
+        content=ErrorResponse(error=error_detail).model_dump(),
+    )
+
+
+@app.get("/")
+async def root_index():
+    """Welcome index page for browser landing."""
+    return {
+        "name": "Nancy",
+        "description": "API Orchestrator for converting free chatbot interfaces into structured APIs.",
+        "version": "0.1.0",
+        "docs_url": "/docs",
+        "health_check": "/health",
+    }
+
+
+
+============================================================
+FILE: hf-space/config.py
+============================================================
+"""
+Nancy HF Space — Configuration Module.
+
+All settings are loaded from environment variables with sensible defaults.
+Provider configuration can be supplied as a JSON string via PROVIDERS_CONFIG.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings
+
+logger = logging.getLogger("nancy.config")
+
+
+class Settings(BaseSettings):
+    """Application settings sourced from environment variables."""
+
+    # ── Auth ──────────────────────────────────────────────────────────
+    nancy_api_key: str = Field(
+        default="nancy-dev-key",
+        description="Bearer token required for /v1/* API endpoints.",
+    )
+    nancy_ext_secret: str = Field(
+        default="nancy-ext-dev-secret",
+        description="Bearer token required for /ext/* extension endpoints.",
+    )
+
+    # ── Upstash Redis (optional) ──────────────────────────────────────
+    upstash_redis_rest_url: str = Field(
+        default="",
+        description="Upstash Redis REST URL. Leave empty to use in-memory fallback.",
+    )
+    upstash_redis_rest_token: str = Field(
+        default="",
+        description="Upstash Redis REST bearer token.",
+    )
+
+    # ── Official Paid APIs / Hybrid Keys (optional) ───────────────────
+    mistral_api_key: str = Field(default="", description="Official Mistral API Key.")
+    nvidia_nim_api_key: str = Field(default="", description="Official NVIDIA NIM API Key.")
+    deepseek_api_key: str = Field(default="", description="Official DeepSeek API Key.")
+    anthropic_api_key: str = Field(default="", description="Official Anthropic/Claude API Key.")
+    z_ai_api_key: str = Field(default="", description="Official Z.ai API Key.")
+
+    # ── Provider Routing ──────────────────────────────────────────────
+    default_provider: str = Field(
+        default="chatgpt",
+        description="Default provider when the model name is not recognized.",
+    )
+    fallback_chain: list[str] = Field(
+        default=["chatgpt", "gemini", "deepseek", "kimi", "claude", "nim", "zai"],
+        description="Ordered list of providers to try on failure.",
+    )
+    providers_config: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "chatgpt":  {"rpm": 10, "tpm": 40000, "url_pattern": "https://chatgpt.com"},
+            "gemini":   {"rpm": 15, "tpm": 60000, "url_pattern": "https://gemini.google.com"},
+            "deepseek": {"rpm": 10, "tpm": 40000, "url_pattern": "https://chat.deepseek.com"},
+            "kimi":     {"rpm": 10, "tpm": 40000, "url_pattern": "https://kimi.moonshot.cn"},
+            "claude":   {"rpm": 5,  "tpm": 30000, "url_pattern": "https://claude.ai"},
+            "nim":      {"rpm": 5,  "tpm": 20000, "url_pattern": "https://build.nvidia.com/nim"},
+            "zai":      {"rpm": 5,  "tpm": 20000, "url_pattern": "https://chat.z.ai"},
+        },
+        description="Per-provider configuration. Supply as JSON string via env var.",
+    )
+
+
+    # ── Circuit Breaker ───────────────────────────────────────────────
+    cb_failure_threshold: int = Field(
+        default=3,
+        description="Consecutive failures before tripping the circuit breaker.",
+    )
+    cb_cooldown_seconds: float = Field(
+        default=60.0,
+        description="Seconds to wait before retrying a tripped provider.",
+    )
+
+    # ── Task Queue ────────────────────────────────────────────────────
+    task_timeout_seconds: float = Field(
+        default=120.0,
+        description="Max seconds to wait for extension to complete a task.",
+    )
+    task_queue_max_size: int = Field(
+        default=100,
+        description="Maximum number of pending tasks in the queue.",
+    )
+
+    # ── Extension ─────────────────────────────────────────────────────
+    ext_heartbeat_timeout_seconds: float = Field(
+        default=30.0,
+        description="Seconds after last heartbeat before extension is considered offline.",
+    )
+    ext_sse_keepalive_seconds: float = Field(
+        default=15.0,
+        description="Interval for SSE keepalive pings to the extension.",
+    )
+
+    # ── Server ────────────────────────────────────────────────────────
+    log_level: str = Field(default="INFO", description="Logging level.")
+    cors_origins: list[str] = Field(
+        default=["*"],
+        description="Allowed CORS origins.",
+    )
+
+    # ── Validators ────────────────────────────────────────────────────
+    @field_validator("providers_config", mode="before")
+    @classmethod
+    def parse_providers_json(cls, v: Any) -> dict[str, Any]:
+        """Accept a JSON string or dict for providers_config."""
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except json.JSONDecodeError as exc:
+                logger.error("Invalid PROVIDERS_CONFIG JSON: %s", exc)
+                raise ValueError(f"PROVIDERS_CONFIG is not valid JSON: {exc}") from exc
+        return v
+
+    @field_validator("fallback_chain", mode="before")
+    @classmethod
+    def parse_fallback_chain(cls, v: Any) -> list[str]:
+        """Accept a comma-separated string or list."""
+        if isinstance(v, str):
+            return [s.strip() for s in v.split(",") if s.strip()]
+        return v
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, v: Any) -> list[str]:
+        """Accept a comma-separated string or list."""
+        if isinstance(v, str):
+            return [s.strip() for s in v.split(",") if s.strip()]
+        return v
+
+    @property
+    def redis_enabled(self) -> bool:
+        """Return True if Upstash Redis is configured."""
+        return bool(self.upstash_redis_rest_url and self.upstash_redis_rest_token)
+
+    model_config = {"env_prefix": "", "case_sensitive": False}
+
+
+# Module-level singleton
+settings = Settings()
+
+
+
+============================================================
+FILE: hf-space/core/router.py
+============================================================
+"""
+Nancy — Provider Router.
+
+Responsible for selecting which provider handles a given request.
+Implements:
+  - Circuit breaker (trip after N consecutive failures, cooldown period)
+  - RPM rate limiting (sliding window per provider)
+  - Fallback chains (try next provider when current is unavailable)
+  - Model → provider name resolution
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+from config import settings
+from models.provider import CircuitState, ProviderConfig, ProviderState
+
+logger = logging.getLogger("nancy.router")
+
+
+# ── Model-to-Provider mapping ────────────────────────────────────────────────
+
+# Maps model name aliases to canonical provider names.
+# The extension uses the provider name to know which chatbot tab to target.
+MODEL_TO_PROVIDER: dict[str, str] = {
+    # ChatGPT
+    "chatgpt": "chatgpt",
+    "gpt-4": "chatgpt",
+    "gpt-4o": "chatgpt",
+    "gpt-4o-mini": "chatgpt",
+    "gpt-3.5-turbo": "chatgpt",
+    # Gemini
+    "gemini": "gemini",
+    "gemini-pro": "gemini",
+    "gemini-2.0-flash": "gemini",
+    "gemini-2.5-pro": "gemini",
+    # DeepSeek
+    "deepseek": "deepseek",
+    "deepseek-chat": "deepseek",
+    "deepseek-r1": "deepseek",
+    # Kimi
+    "kimi": "kimi",
+    "moonshot": "kimi",
+    # Official Paid API / Hybrid models
+    "mistral-large": "api-mistral",
+    "nvidia-llama3": "api-nvidia-nim",
+    "deepseek-api": "api-deepseek",
+    "claude-api": "api-anthropic",
+    "z-ai-api": "api-z-ai",
+    # Browser relay: NIM Portal (free playground)
+    "nim": "nim",
+    "nim-llama3": "nim",
+    "nim-mistral": "nim",
+    # Browser relay: z.ai portal
+    "zai": "zai",
+    "z-ai": "zai",
+    # Claude (browser portal)
+    "claude": "claude",
+    "claude-3": "claude",
+}
+
+
+class ProviderRouter:
+    """
+    Selects providers for incoming requests with circuit breaking,
+    rate limiting, and fallback chain support.
+
+    Usage::
+
+        router = ProviderRouter()
+        provider = router.resolve("gpt-4o")        # → "chatgpt"
+        available = router.select_provider("chatgpt")  # checks CB + RPM
+        router.record_success("chatgpt")
+        router.record_failure("chatgpt")
+    """
+
+    def __init__(self) -> None:
+        self._states: dict[str, ProviderState] = {}
+        self._initialize_providers()
+
+    def _initialize_providers(self) -> None:
+        """Build ProviderState objects from configuration."""
+        for name, raw_config in settings.providers_config.items():
+            config = ProviderConfig(**raw_config) if isinstance(raw_config, dict) else ProviderConfig()
+            self._states[name] = ProviderState(name, config)
+            logger.info(
+                "Provider '%s' initialized (rpm=%d, tpm=%d)",
+                name,
+                config.rpm,
+                config.tpm,
+            )
+
+        # Ensure all fallback chain providers exist
+        for name in settings.fallback_chain:
+            if name not in self._states:
+                self._states[name] = ProviderState(name, ProviderConfig())
+                logger.info("Provider '%s' added from fallback chain with defaults", name)
+
+    # ── Resolution ────────────────────────────────────────────────────
+
+    def resolve(self, model: str) -> str:
+        """
+        Resolve a model name to a canonical provider name.
+
+        Falls back to ``settings.default_provider`` if the model is unknown.
+        """
+        provider = MODEL_TO_PROVIDER.get(model.lower(), model.lower())
+        # If the resolved name is a known provider, use it
+        if provider in self._states:
+            return provider
+        # Otherwise fall back to default
+        logger.debug(
+            "Unknown model '%s' → defaulting to '%s'",
+            model,
+            settings.default_provider,
+        )
+        return settings.default_provider
+
+    # ── Provider Selection with Circuit Breaker + Rate Limit ──────────
+
+    def select_provider(
+        self,
+        preferred: str,
+        exclude: set[str] | None = None,
+    ) -> str | None:
+        """
+        Select the best available provider.
+
+        1. Try the preferred provider first.
+        2. If it's unavailable (circuit open, rate limited), walk the fallback chain.
+        3. Return ``None`` if no provider is available.
+
+        Args:
+            preferred: The preferred provider name.
+            exclude: Set of provider names to skip (already tried and failed).
+        """
+        exclude = exclude or set()
+        candidates = [preferred] + [
+            p for p in settings.fallback_chain if p != preferred
+        ]
+
+        for name in candidates:
+            if name in exclude:
+                continue
+
+            state = self._states.get(name)
+            if not state:
+                continue
+
+            # Check circuit breaker
+            if not state.should_allow_request(
+                settings.cb_failure_threshold,
+                settings.cb_cooldown_seconds,
+            ):
+                logger.debug("Provider '%s' circuit is OPEN — skipping", name)
+                continue
+
+            # Check rate limit
+            if not state.check_rate_limit():
+                logger.debug("Provider '%s' rate limited — skipping", name)
+                continue
+
+            # Record the request
+            state.record_request()
+            logger.info("Selected provider: '%s'", name)
+            return name
+
+        logger.error(
+            "No available provider (preferred=%s, exclude=%s)",
+            preferred,
+            exclude,
+        )
+        return None
+
+    # ── Feedback ──────────────────────────────────────────────────────
+
+    def record_success(self, provider: str) -> None:
+        """Record a successful completion for the given provider."""
+        state = self._states.get(provider)
+        if state:
+            state.record_success()
+            logger.debug("Provider '%s' success recorded", provider)
+
+    def record_failure(self, provider: str) -> None:
+        """Record a failure for the given provider (may trip circuit)."""
+        state = self._states.get(provider)
+        if state:
+            state.record_failure(settings.cb_failure_threshold)
+            logger.warning(
+                "Provider '%s' failure recorded (consecutive=%d, circuit=%s)",
+                provider,
+                state.consecutive_failures,
+                state.circuit_state.value,
+            )
+
+    # ── Observability ─────────────────────────────────────────────────
+
+    def get_provider_states(self) -> list[dict[str, Any]]:
+        """Return status dicts for all providers."""
+        return [state.to_dict() for state in self._states.values()]
+
+    def get_available_models(self) -> list[str]:
+        """Return list of all recognized model names."""
+        return sorted(MODEL_TO_PROVIDER.keys())
+
+    def get_available_providers(self) -> list[str]:
+        """Return list of all configured provider names."""
+        return sorted(self._states.keys())
+
+    def is_provider_available(self, provider: str) -> bool:
+        """Check if a specific provider is currently available."""
+        state = self._states.get(provider)
+        if not state:
+            return False
+        return (
+            state.should_allow_request(
+                settings.cb_failure_threshold,
+                settings.cb_cooldown_seconds,
+            )
+            and state.check_rate_limit()
+        )
+
+
+# Module-level singleton
+provider_router = ProviderRouter()
+
+
+
+============================================================
+FILE: hf-space/core/queue.py
+============================================================
+"""
+Nancy — Task Queue.
+
+Manages the lifecycle of tasks using ``asyncio.Queue`` for the pending
+work queue and a dict of ``TaskHandle`` objects for in-flight coordination.
+
+The queue bridges two sides:
+  - **API side** (producer): creates a task, enqueues it, waits for chunks.
+  - **Extension side** (consumer): dequeues tasks via SSE, pushes response chunks.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import AsyncIterator
+
+from config import settings
+from models.task import Task, TaskHandle, TaskStatus
+
+logger = logging.getLogger("nancy.queue")
+
+
+class TaskQueue:
+    """
+    Central task queue and handle registry.
+
+    This is a singleton that coordinates between the API router
+    (which creates tasks) and the extension router (which fulfills them).
+
+    Attributes:
+        _pending: asyncio.Queue of Task objects waiting for an extension.
+        _handles: dict mapping ``task_id`` → ``TaskHandle`` for in-flight tasks.
+        _history: bounded list of recently completed task summaries.
+    """
+
+    def __init__(self, max_size: int | None = None) -> None:
+        self._max_size = max_size or settings.task_queue_max_size
+        self._pending: asyncio.Queue[Task] = asyncio.Queue(maxsize=self._max_size)
+        self._handles: dict[str, TaskHandle] = {}
+        self._history: list[dict] = []
+        self._max_history = 100
+        # Event fired whenever a new task is enqueued — used to wake the
+        # extension SSE stream.
+        self._new_task_event = asyncio.Event()
+
+    # ── API-side operations ───────────────────────────────────────────
+
+    async def submit_task(self, task: Task) -> TaskHandle:
+        """
+        Submit a new task and return its handle.
+
+        The handle's ``chunk_queue`` and ``done_event`` are used by the
+        API router to stream chunks back to the caller.
+
+        Raises:
+            asyncio.QueueFull: If the pending queue is at capacity.
+        """
+        handle = TaskHandle(task)
+        self._handles[task.task_id] = handle
+
+        try:
+            self._pending.put_nowait(task)
+        except asyncio.QueueFull:
+            # Clean up the handle
+            self._handles.pop(task.task_id, None)
+            logger.error("Task queue full — rejecting task %s", task.task_id)
+            raise
+
+        self._new_task_event.set()
+        logger.info(
+            "Task %s submitted (provider=%s, model=%s, queue_size=%d)",
+            task.task_id,
+            task.provider,
+            task.model,
+            self._pending.qsize(),
+        )
+        return handle
+
+    def get_handle(self, task_id: str) -> TaskHandle | None:
+        """Retrieve a handle by task ID, or None if not found."""
+        return self._handles.get(task_id)
+
+    async def wait_for_completion(
+        self,
+        handle: TaskHandle,
+        timeout: float | None = None,
+    ) -> None:
+        """
+        Block until the task is done or timeout expires.
+
+        This is used for *non-streaming* requests that need the full response.
+
+        Raises:
+            asyncio.TimeoutError: If the task does not complete in time.
+        """
+        timeout = timeout or settings.task_timeout_seconds
+        try:
+            await asyncio.wait_for(handle.done_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            handle.task.status = TaskStatus.TIMED_OUT
+            handle.task.error = f"Task timed out after {timeout}s"
+            handle.finish(error=handle.task.error)
+            raise
+
+    async def stream_chunks(
+        self,
+        handle: TaskHandle,
+        timeout: float | None = None,
+    ) -> AsyncIterator[str]:
+        """
+        Async generator that yields text chunks from the extension.
+
+        Yields chunks until a ``None`` sentinel is received (end of stream)
+        or the timeout expires.
+        """
+        timeout = timeout or settings.task_timeout_seconds
+        deadline = time.time() + timeout
+
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                handle.task.status = TaskStatus.TIMED_OUT
+                handle.task.error = "Streaming timed out"
+                logger.warning("Task %s stream timed out", handle.task_id)
+                break
+
+            try:
+                chunk = await asyncio.wait_for(
+                    handle.chunk_queue.get(),
+                    timeout=min(remaining, 30.0),
+                )
+            except asyncio.TimeoutError:
+                # Check if there's still time left
+                if time.time() >= deadline:
+                    handle.task.status = TaskStatus.TIMED_OUT
+                    handle.task.error = "Streaming timed out"
+                    logger.warning("Task %s stream timed out", handle.task_id)
+                    break
+                continue
+
+            if chunk is None:
+                # End-of-stream sentinel
+                break
+
+            yield chunk
+
+    # ── Extension-side operations ─────────────────────────────────────
+
+    async def dequeue_task(self, timeout: float = 30.0) -> Task | None:
+        """
+        Dequeue the next pending task.
+
+        Returns ``None`` if no task is available within ``timeout`` seconds.
+        Used by the extension SSE stream.
+        """
+        try:
+            task = await asyncio.wait_for(self._pending.get(), timeout=timeout)
+            task.status = TaskStatus.ASSIGNED
+            task.assigned_at = time.time()
+            logger.info("Task %s dequeued (provider=%s)", task.task_id, task.provider)
+            return task
+        except asyncio.TimeoutError:
+            return None
+
+    def push_chunk(self, task_id: str, chunk: str) -> bool:
+        """
+        Push a response chunk for a task. Returns False if task not found.
+        """
+        handle = self._handles.get(task_id)
+        if not handle:
+            logger.warning("Chunk received for unknown task %s", task_id)
+            return False
+        if handle.task.status == TaskStatus.ASSIGNED:
+            handle.task.status = TaskStatus.STREAMING
+        handle.push_chunk(chunk)
+        return True
+
+    def complete_task(self, task_id: str, error: str | None = None) -> bool:
+        """
+        Mark a task as complete. Returns False if task not found.
+        """
+        handle = self._handles.get(task_id)
+        if not handle:
+            logger.warning("Completion signal for unknown task %s", task_id)
+            return False
+        handle.finish(error=error)
+
+        # Archive to history
+        self._history.append(handle.task.to_status_dict())
+        if len(self._history) > self._max_history:
+            self._history = self._history[-self._max_history:]
+
+        logger.info(
+            "Task %s completed (status=%s, error=%s)",
+            task_id,
+            handle.task.status.value,
+            error,
+        )
+        return True
+
+    def cleanup_task(self, task_id: str) -> None:
+        """Remove a task handle from the registry."""
+        self._handles.pop(task_id, None)
+
+    # ── Observability ─────────────────────────────────────────────────
+
+    @property
+    def pending_count(self) -> int:
+        """Number of tasks waiting in the queue."""
+        return self._pending.qsize()
+
+    @property
+    def active_count(self) -> int:
+        """Number of in-flight task handles."""
+        return len(self._handles)
+
+    @property
+    def new_task_event(self) -> asyncio.Event:
+        """Event that fires when a new task is enqueued."""
+        return self._new_task_event
+
+    def get_status(self) -> dict:
+        """Return queue status for health endpoints."""
+        return {
+            "pending": self.pending_count,
+            "active": self.active_count,
+            "max_size": self._max_size,
+            "recent_history": len(self._history),
+        }
+
+    def get_active_tasks(self) -> list[dict]:
+        """Return status dicts for all active tasks."""
+        return [h.task.to_status_dict() for h in self._handles.values()]
+
+    def get_history(self, limit: int = 20) -> list[dict]:
+        """Return recent task history."""
+        return self._history[-limit:]
+
+
+# Module-level singleton
+task_queue = TaskQueue()
+
+
+
+============================================================
+FILE: hf-space/core/redis_client.py
+============================================================
+"""
+Nancy — Upstash Redis REST API client.
+
+Uses ``httpx`` to communicate with Upstash Redis via its REST interface.
+All operations are optional — if Redis is not configured, methods are
+no-ops that return sensible defaults.
+
+This allows the HF Space to work without any external dependencies while
+supporting persistence when Upstash credentials are provided.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+
+import httpx
+
+from config import settings
+
+logger = logging.getLogger("nancy.redis")
+
+
+class RedisClient:
+    """
+    Async client for the Upstash Redis REST API.
+
+    All public methods are safe to call even when Redis is not configured —
+    they will log a debug message and return ``None`` / empty defaults.
+
+    Usage::
+
+        redis = RedisClient()
+        await redis.set("key", "value", ex=300)
+        val = await redis.get("key")
+    """
+
+    def __init__(self) -> None:
+        self._enabled = settings.redis_enabled
+        self._base_url = settings.upstash_redis_rest_url.rstrip("/")
+        self._token = settings.upstash_redis_rest_token
+        self._client: httpx.AsyncClient | None = None
+
+    @property
+    def is_enabled(self) -> bool:
+        """Return True if Redis is configured and the client is initialized."""
+        return self._enabled and self._client is not None
+
+
+    async def startup(self) -> None:
+        """Initialize the HTTP client. Call during app startup."""
+        if not self._enabled:
+            logger.info("Redis not configured — using in-memory fallbacks.")
+            return
+        self._client = httpx.AsyncClient(
+            base_url=self._base_url,
+            headers={"Authorization": f"Bearer {self._token}"},
+            timeout=httpx.Timeout(10.0, connect=5.0),
+        )
+        # Verify connectivity
+        try:
+            resp = await self._client.post("/", json=["PING"])
+            resp.raise_for_status()
+            logger.info("Redis connected: %s", resp.json())
+        except Exception as exc:
+            logger.warning("Redis PING failed (non-fatal): %s", exc)
+
+    async def shutdown(self) -> None:
+        """Close the HTTP client. Call during app shutdown."""
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+
+    # ── Low-level command execution ───────────────────────────────────
+
+    async def _execute(self, *args: str) -> Any:
+        """
+        Execute a raw Redis command via the REST API.
+
+        Returns the ``result`` field from the Upstash response, or ``None``
+        on error / when Redis is disabled.
+        """
+        if not self._enabled or not self._client:
+            return None
+        try:
+            resp = await self._client.post("/", json=list(args))
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("result")
+        except httpx.HTTPStatusError as exc:
+            logger.error("Redis HTTP error: %s %s", exc.response.status_code, exc.response.text)
+            return None
+        except Exception as exc:
+            logger.error("Redis error: %s", exc)
+            return None
+
+    # ── High-level operations ─────────────────────────────────────────
+
+    async def get(self, key: str) -> str | None:
+        """Get a string value by key."""
+        return await self._execute("GET", key)
+
+    async def set(
+        self,
+        key: str,
+        value: str,
+        ex: int | None = None,
+    ) -> bool:
+        """
+        Set a string value, optionally with expiration in seconds.
+
+        Returns True on success.
+        """
+        if ex is not None:
+            result = await self._execute("SET", key, value, "EX", str(ex))
+        else:
+            result = await self._execute("SET", key, value)
+        return result == "OK"
+
+    async def delete(self, key: str) -> bool:
+        """Delete a key. Returns True if the key existed."""
+        result = await self._execute("DEL", key)
+        return result is not None and int(result) > 0
+
+    async def incr(self, key: str) -> int | None:
+        """Increment an integer key. Returns the new value."""
+        result = await self._execute("INCR", key)
+        return int(result) if result is not None else None
+
+    async def expire(self, key: str, seconds: int) -> bool:
+        """Set expiration on an existing key."""
+        result = await self._execute("EXPIRE", key, str(seconds))
+        return result is not None and int(result) == 1
+
+    async def lpush(self, key: str, value: str) -> int | None:
+        """Push a value to the head of a list."""
+        result = await self._execute("LPUSH", key, value)
+        return int(result) if result is not None else None
+
+    async def lrange(self, key: str, start: int, stop: int) -> list[str]:
+        """Return a range of elements from a list."""
+        result = await self._execute("LRANGE", key, str(start), str(stop))
+        return result if isinstance(result, list) else []
+
+    async def hset(self, key: str, field: str, value: str) -> bool:
+        """Set a hash field."""
+        result = await self._execute("HSET", key, field, value)
+        return result is not None
+
+    async def hget(self, key: str, field: str) -> str | None:
+        """Get a hash field value."""
+        return await self._execute("HGET", key, field)
+
+    async def hgetall(self, key: str) -> dict[str, str]:
+        """Get all fields and values in a hash."""
+        result = await self._execute("HGETALL", key)
+        if not result or not isinstance(result, list):
+            return {}
+        # Upstash returns [field1, val1, field2, val2, ...]
+        it = iter(result)
+        return dict(zip(it, it))
+
+    # ── JSON helpers ──────────────────────────────────────────────────
+
+    async def set_json(
+        self,
+        key: str,
+        value: Any,
+        ex: int | None = None,
+    ) -> bool:
+        """Serialize ``value`` as JSON and store it."""
+        return await self.set(key, json.dumps(value, default=str), ex=ex)
+
+    async def get_json(self, key: str) -> Any | None:
+        """Retrieve and deserialize a JSON value."""
+        raw = await self.get(key)
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse JSON for key '%s'", key)
+            return None
+
+
+# Module-level singleton
+redis_client = RedisClient()
+
+
+
+============================================================
+FILE: hf-space/core/sessions.py
+============================================================
+"""
+Nancy HF Space — Session Manager.
+
+Manages multi-conversation sessions so agents can:
+  - Start fresh conversations (new chat)
+  - Resume specific past conversations by navigating to their saved URLs
+  - Track conversation URLs per provider and session
+  - Persist sessions in Upstash Redis (with in-memory fallback)
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+import uuid
+from typing import Any
+
+from core.redis_client import redis_client
+
+logger = logging.getLogger("nancy.sessions")
+
+# ── Session Data Structure ─────────────────────────────────────────────────────
+
+class SessionRecord:
+    """Represents a tracked conversation session."""
+
+    def __init__(
+        self,
+        session_id: str,
+        provider: str,
+        title: str | None = None,
+        conversation_url: str | None = None,
+        system_prompt: str | None = None,
+    ) -> None:
+        self.session_id = session_id
+        self.provider = provider
+        self.title = title or f"Session {session_id[:8]}"
+        self.conversation_url = conversation_url
+        self.system_prompt = system_prompt
+        self.created_at: float = time.time()
+        self.last_used_at: float = time.time()
+        self.message_count: int = 0
+        self.status: str = "active"  # active | archived | error
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to dictionary for Redis storage and API responses."""
+        return {
+            "session_id": self.session_id,
+            "provider": self.provider,
+            "title": self.title,
+            "conversation_url": self.conversation_url,
+            "system_prompt": self.system_prompt,
+            "created_at": self.created_at,
+            "last_used_at": self.last_used_at,
+            "message_count": self.message_count,
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SessionRecord":
+        """Deserialize from dictionary (from Redis)."""
+        session = cls(
+            session_id=data["session_id"],
+            provider=data["provider"],
+            title=data.get("title"),
+            conversation_url=data.get("conversation_url"),
+            system_prompt=data.get("system_prompt"),
+        )
+        session.created_at = data.get("created_at", time.time())
+        session.last_used_at = data.get("last_used_at", time.time())
+        session.message_count = data.get("message_count", 0)
+        session.status = data.get("status", "active")
+        return session
+
+
+# ── Session Store ──────────────────────────────────────────────────────────────
+
+class SessionStore:
+    """
+    Manages conversation sessions.
+    Uses Upstash Redis for persistence if available, in-memory dict otherwise.
+    """
+
+    REDIS_PREFIX = "nancy:session:"
+    REDIS_INDEX_KEY = "nancy:sessions:index"
+    SESSION_TTL = 60 * 60 * 24 * 30  # 30 days in seconds
+
+    def __init__(self) -> None:
+        # In-memory fallback when Redis is not configured
+        self._sessions: dict[str, SessionRecord] = {}
+
+    # ── CRUD ───────────────────────────────────────────────────────────
+
+    async def create_session(
+        self,
+        provider: str,
+        title: str | None = None,
+        system_prompt: str | None = None,
+    ) -> SessionRecord:
+        """
+        Create a new session and persist it.
+
+        Args:
+            provider: Target provider key (e.g. "chatgpt", "gemini")
+            title: Optional human-readable title for the session
+            system_prompt: Optional system prompt to prepend in new chat
+
+        Returns:
+            The newly created SessionRecord
+        """
+        session_id = str(uuid.uuid4())
+        session = SessionRecord(
+            session_id=session_id,
+            provider=provider,
+            title=title,
+            system_prompt=system_prompt,
+        )
+
+        await self._save(session)
+        logger.info("Created session '%s' for provider '%s'", session_id[:8], provider)
+        return session
+
+    async def get_session(self, session_id: str) -> SessionRecord | None:
+        """Fetch a session by ID."""
+        # Try Redis first
+        data = await redis_client.get(f"{self.REDIS_PREFIX}{session_id}")
+        if data:
+            try:
+                import json
+                return SessionRecord.from_dict(json.loads(data))
+            except Exception as e:
+                logger.warning("Failed to deserialize session '%s': %s", session_id[:8], e)
+
+        # Fall back to in-memory
+        return self._sessions.get(session_id)
+
+    async def list_sessions(self, provider: str | None = None) -> list[SessionRecord]:
+        """
+        List all known sessions, optionally filtered by provider.
+
+        Returns sessions sorted by last_used_at descending.
+        """
+        sessions: list[SessionRecord] = []
+
+        # Try Redis
+        if redis_client.is_enabled:
+            try:
+                import json
+                index = await redis_client.get(self.REDIS_INDEX_KEY)
+                if index:
+                    session_ids: list[str] = json.loads(index)
+                    for sid in session_ids:
+                        session = await self.get_session(sid)
+                        if session and session.status != "archived":
+                            sessions.append(session)
+            except Exception as e:
+                logger.warning("Redis session list failed, using in-memory: %s", e)
+
+        if not sessions:
+            sessions = [s for s in self._sessions.values() if s.status != "archived"]
+
+        if provider:
+            sessions = [s for s in sessions if s.provider == provider]
+
+        sessions.sort(key=lambda s: s.last_used_at, reverse=True)
+        return sessions
+
+    async def update_session_url(
+        self,
+        session_id: str,
+        conversation_url: str,
+        message_count_delta: int = 1,
+    ) -> None:
+        """
+        Update a session's conversation URL after a task completes.
+        Called by the extension via the server when it reports back the active tab URL.
+
+        Args:
+            session_id: The session to update
+            conversation_url: The current browser tab URL (e.g. chatgpt.com/c/abc123)
+            message_count_delta: How many messages to add to the count
+        """
+        session = await self.get_session(session_id)
+        if not session:
+            logger.warning("Cannot update URL: session '%s' not found", session_id[:8])
+            return
+
+        session.conversation_url = conversation_url
+        session.last_used_at = time.time()
+        session.message_count += message_count_delta
+
+        await self._save(session)
+        logger.info(
+            "Session '%s' URL updated → %s (total messages: %d)",
+            session_id[:8], conversation_url, session.message_count
+        )
+
+    async def delete_session(self, session_id: str) -> bool:
+        """
+        Soft-delete (archive) a session.
+
+        Returns True if the session was found and archived.
+        """
+        session = await self.get_session(session_id)
+        if not session:
+            return False
+
+        session.status = "archived"
+        await self._save(session)
+        logger.info("Session '%s' archived", session_id[:8])
+        return True
+
+    # ── Internal helpers ───────────────────────────────────────────────
+
+    async def _save(self, session: SessionRecord) -> None:
+        """Persist session to Redis and in-memory."""
+        import json
+        data = json.dumps(session.to_dict())
+
+        # Always keep in-memory
+        self._sessions[session.session_id] = session
+
+        # Persist to Redis if available
+        if redis_client.is_enabled:
+            try:
+                await redis_client.set(
+                    f"{self.REDIS_PREFIX}{session.session_id}",
+                    data,
+                    ex=self.SESSION_TTL,
+                )
+                # Update the index
+                index_data = await redis_client.get(self.REDIS_INDEX_KEY)
+                session_ids: list[str] = json.loads(index_data) if index_data else []
+                if session.session_id not in session_ids:
+                    session_ids.append(session.session_id)
+                    await redis_client.set(
+                        self.REDIS_INDEX_KEY,
+                        json.dumps(session_ids),
+                        ex=self.SESSION_TTL,
+                    )
+            except Exception as e:
+                logger.warning("Failed to persist session to Redis: %s", e)
+
+
+# Module-level singleton
+session_store = SessionStore()
+
+
+
+============================================================
+FILE: hf-space/core/tools.py
+============================================================
+"""
+Nancy HF Space — Executable Tools Core.
+
+Provides standard server-side tools that can be exposed to AI agents (like Ultron)
+and executed locally on the FastAPI backend.
+"""
+
+from __future__ import annotations
+
+import logging
+import json
+from typing import Any, Callable
+
+from core.sessions import session_store
+
+logger = logging.getLogger("nancy.tools")
+
+# ─── Built-in Tools Implementation ──────────────────────────────────────────
+
+async def web_search(query: str) -> str:
+    """
+    Search the web for the given query using DuckDuckGo Search.
+    
+    Args:
+        query: The search query string.
+        
+    Returns:
+        A text summary of top search results.
+    """
+    logger.info("Executing web search: '%s'", query)
+    try:
+        from duckduckgo_search import DDGS
+        with DDGS() as ddgs:
+            results = list(ddgs.text(query, max_results=5))
+            if not results:
+                return "No search results found."
+            
+            output = []
+            for i, r in enumerate(results, 1):
+                title = r.get("title", "No Title")
+                href = r.get("href", "#")
+                body = r.get("body", "")
+                output.append(f"[{i}] {title}\nURL: {href}\nSnippet: {body}\n")
+            return "\n".join(output)
+    except Exception as e:
+        logger.error("Web search failed for query '%s': %s", query, e)
+        return f"Error executing web search: {str(e)}"
+
+
+async def nancy_new_chat(provider: str, system_prompt: str | None = None, title: str | None = None) -> str:
+    """
+    Start a brand new conversation session with the specified provider.
+    
+    Args:
+        provider: Target chatbot provider (e.g. 'chatgpt', 'gemini', 'deepseek').
+        system_prompt: Optional initial prompt or instructions to prep in the new chat.
+        title: Optional custom session title.
+        
+    Returns:
+        JSON string indicating new session details.
+    """
+    logger.info("Creating new session for provider '%s'", provider)
+    try:
+        session = await session_store.create_session(
+            provider=provider,
+            title=title,
+            system_prompt=system_prompt
+        )
+        return json.dumps({
+            "status": "success",
+            "message": "New chat session created successfully. To use it, pass the session_id in the 'user' field in future completions.",
+            "session_id": session.session_id,
+            "provider": session.provider,
+            "title": session.title
+        })
+    except Exception as e:
+        logger.error("Failed to create new session: %s", e)
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+async def nancy_resume_chat(session_id: str) -> str:
+    """
+    Retrieve details of a saved chat session to resume it.
+    
+    Args:
+        session_id: The UUID of the session.
+        
+    Returns:
+        JSON string with session details.
+    """
+    logger.info("Resuming session: '%s'", session_id)
+    try:
+        session = await session_store.get_session(session_id)
+        if not session:
+            return json.dumps({"status": "error", "message": f"Session {session_id} not found."})
+        return json.dumps({
+            "status": "success",
+            "session_id": session.session_id,
+            "provider": session.provider,
+            "title": session.title,
+            "conversation_url": session.conversation_url,
+            "system_prompt": session.system_prompt,
+            "message_count": session.message_count,
+            "status_state": session.status
+        })
+    except Exception as e:
+        logger.error("Failed to resume session '%s': %s", session_id, e)
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+async def nancy_list_sessions(provider: str | None = None) -> str:
+    """
+    List all tracked conversation sessions, optionally filtered by provider.
+    
+    Args:
+        provider: Optional filter (e.g. 'chatgpt', 'gemini').
+        
+    Returns:
+        JSON string with session list.
+    """
+    logger.info("Listing sessions. Filter: %s", provider)
+    try:
+        sessions = await session_store.list_sessions(provider=provider)
+        serialized = [s.to_dict() for s in sessions]
+        return json.dumps({
+            "status": "success",
+            "sessions": serialized
+        })
+    except Exception as e:
+        logger.error("Failed to list sessions: %s", e)
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+# ─── Tool Registry & Dispatcher ──────────────────────────────────────────────
+
+class ToolRegistry:
+    """Registry mapping tool names to their async handlers and schemas."""
+
+    def __init__(self) -> None:
+        self._handlers: dict[str, Callable[..., Any]] = {}
+        self._schemas: list[dict[str, Any]] = []
+
+        # Register our built-in tools
+        self.register("web_search", web_search, {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web for real-time information or questions requiring search.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query text."
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        })
+
+        self.register("nancy_new_chat", nancy_new_chat, {
+            "type": "function",
+            "function": {
+                "name": "nancy_new_chat",
+                "description": "Start a brand new conversation session with a chatbot provider.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "provider": {
+                            "type": "string",
+                            "description": "Target provider key, e.g. 'chatgpt', 'gemini', 'deepseek'."
+                        },
+                        "system_prompt": {
+                            "type": "string",
+                            "description": "Optional instructions/rules to prepend to this conversation."
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Optional human-readable title."
+                        }
+                    },
+                    "required": ["provider"]
+                }
+            }
+        })
+
+        self.register("nancy_resume_chat", nancy_resume_chat, {
+            "type": "function",
+            "function": {
+                "name": "nancy_resume_chat",
+                "description": "Retrieve information on an existing saved chat session by ID.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "The session ID UUID."
+                        }
+                    },
+                    "required": ["session_id"]
+                }
+            }
+        })
+
+        self.register("nancy_list_sessions", nancy_list_sessions, {
+            "type": "function",
+            "function": {
+                "name": "nancy_list_sessions",
+                "description": "List all active saved conversation sessions in Nancy.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "provider": {
+                            "type": "string",
+                            "description": "Optional chatbot provider to filter by."
+                        }
+                    }
+                }
+            }
+        })
+
+    def register(self, name: str, handler: Callable[..., Any], schema: dict[str, Any]) -> None:
+        """Register a new tool."""
+        self._handlers[name] = handler
+        self._schemas.append(schema)
+
+    def get_schemas(self) -> list[dict[str, Any]]:
+        """Get the schemas of all registered tools."""
+        return self._schemas
+
+    async def execute(self, name: str, arguments: dict[str, Any]) -> str:
+        """Execute a tool by name with arguments."""
+        handler = self._handlers.get(name)
+        if not handler:
+            raise ValueError(f"Tool '{name}' is not registered.")
+        
+        try:
+            return await handler(**arguments)
+        except Exception as e:
+            logger.error("Error executing tool '%s': %s", name, e)
+            return f"Execution error: {str(e)}"
+
+
+# Module-level singleton registry
+tool_registry = ToolRegistry()
+
+
+
+============================================================
+FILE: hf-space/routers/api.py
+============================================================
+"""
+Nancy HF Space — OpenAI-Compatible API Router.
+
+Provides standard chat completion and models endpoints matching the OpenAI spec.
+This allows any OpenAI-compatible client (e.g. LiteLLM, langchain, openai SDK)
+to use Nancy as a drop-in replacement backbone.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from typing import AsyncGenerator
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import JSONResponse
+from sse_starlette.sse import EventSourceResponse
+
+from config import settings
+from core.auth import require_api_key
+from core.queue import task_queue
+from core.router import provider_router
+from models.openai import (
+    ChatCompletionChunk,
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ErrorDetail,
+    ErrorResponse,
+    ModelInfo,
+    ModelListResponse,
+)
+from models.task import Task, TaskStatus
+
+logger = logging.getLogger("nancy.api")
+
+def parse_tool_call_json(text: str) -> list[dict] | None:
+    import json
+    import re
+    import uuid
+    text = text.strip()
+    # Strip markdown block if model output it despite instructions
+    if text.startswith("```"):
+        match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+        if match:
+            text = match.group(1).strip()
+            
+    if not (text.startswith("{") and "tool_calls" in text):
+        return None
+        
+    try:
+        data = json.loads(text)
+        if "tool_calls" in data and isinstance(data["tool_calls"], list):
+            validated = []
+            for tc in data["tool_calls"]:
+                if "name" in tc or ("function" in tc and "name" in tc["function"]):
+                    func_name = tc.get("name") or tc["function"].get("name")
+                    args = tc.get("arguments") or tc["function"].get("arguments", {})
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except:
+                            pass
+                    
+                    call_id = tc.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+                    validated.append({
+                        "id": call_id,
+                        "type": tc.get("type", "function"),
+                        "function": {
+                            "name": func_name,
+                            "arguments": json.dumps(args) if isinstance(args, dict) else str(args)
+                        }
+                    })
+            if validated:
+                return validated
+    except Exception as e:
+        logger.warning("Failed to parse potential tool call JSON: %s", e)
+    return None
+
+
+router = APIRouter(prefix="/v1", tags=["OpenAI Compatible API"])
+
+
+@router.post("/chat/completions", response_model=ChatCompletionResponse)
+async def chat_completions(
+    request: ChatCompletionRequest,
+    api_key: str = Depends(require_api_key),
+):
+    """
+    OpenAI-Compatible Chat Completions Endpoint.
+    Receives prompt, selects available provider, enqueues task for extension,
+    and returns either a JSON response or an SSE stream.
+    """
+    # 1. Resolve request model to canonical provider
+    requested_model = request.model
+    provider = provider_router.resolve(requested_model)
+
+    # Inject tool instructions into system prompt if requested
+    import json
+    if request.tools:
+        tools_str = json.dumps(request.tools, indent=2)
+        system_instruction = (
+            "You are a helpful assistant with access to the following server-side tools. "
+            "If you need to call a tool, you MUST respond ONLY with a valid JSON block containing the 'tool_calls' key in this exact format:\n"
+            "{\"tool_calls\": [{\"id\": \"call_abc123\", \"type\": \"function\", \"function\": {\"name\": \"tool_name\", \"arguments\": { ... }}}]}\n"
+            "and absolutely nothing else. Do not add any greeting, markdown formatting (like ```json), or explanatory text before or after the JSON. "
+            "If no tool is needed or you are answering with the tool result, respond with standard conversational text.\n\n"
+            "Here are the available tools:\n"
+            f"{tools_str}"
+        )
+        messages_dump = [msg.model_dump() for msg in request.messages]
+        if messages_dump and messages_dump[0]["role"] == "system":
+            messages_dump[0]["content"] = system_instruction + "\n\n" + (messages_dump[0]["content"] or "")
+        else:
+            messages_dump.insert(0, {"role": "system", "content": system_instruction})
+    else:
+        messages_dump = [msg.model_dump() for msg in request.messages]
+
+    # 2. Select available provider with routing / failover checks
+    selected_provider = provider_router.select_provider(provider)
+    if not selected_provider:
+        error_detail = ErrorDetail(
+            message="No healthy chatbot providers available at the moment.",
+            type="service_unavailable",
+            code="503",
+        )
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content=ErrorResponse(error=error_detail).model_dump(),
+        )
+
+    # 2b. Handle Hybrid Official API Routing
+    if selected_provider.startswith("api-"):
+        import httpx
+        
+        # Resolve target API URL and Authorization headers
+        api_url = ""
+        headers = {"Content-Type": "application/json"}
+        
+        if selected_provider == "api-mistral":
+            api_url = "https://api.mistral.ai/v1/chat/completions"
+            headers["Authorization"] = f"Bearer {settings.mistral_api_key}"
+        elif selected_provider == "api-nvidia-nim":
+            api_url = "https://integrate.api.nvidia.com/v1/chat/completions"
+            headers["Authorization"] = f"Bearer {settings.nvidia_nim_api_key}"
+        elif selected_provider == "api-deepseek":
+            api_url = "https://api.deepseek.com/v1/chat/completions"
+            headers["Authorization"] = f"Bearer {settings.deepseek_api_key}"
+        elif selected_provider == "api-anthropic":
+            api_url = "https://api.anthropic.com/v1/messages"
+            headers["x-api-key"] = settings.anthropic_api_key
+            headers["anthropic-version"] = "2023-06-01"
+        elif selected_provider == "api-z-ai":
+            api_url = "https://api.z.ai/v1/chat/completions"
+            headers["Authorization"] = f"Bearer {settings.z_ai_api_key}"
+            
+        if not api_url:
+            raise HTTPException(status_code=500, detail="API URL not configured for selected hybrid provider.")
+
+        # Prepare request payload matching standard OpenAI schemas
+        # Note: Anthropic uses a different schema, but we keep it simple for OpenAI compatible endpoints here
+        payload = request.model_dump(exclude_none=True)
+        # Override the model name in request to use the canonical official API model
+        if selected_provider == "api-mistral":
+            payload["model"] = "mistral-large-latest"
+        elif selected_provider == "api-nvidia-nim":
+            payload["model"] = "meta/llama3-70b-instruct"
+        elif selected_provider == "api-deepseek":
+            payload["model"] = "deepseek-chat"
+        elif selected_provider == "api-anthropic":
+            # Direct mapping from openai to anthropic messages format if needed, 
+            # but for hybrid fallbacks we assume standard OpenAI endpoints or proxy models.
+            payload["model"] = "claude-3-5-sonnet-latest"
+        elif selected_provider == "api-z-ai":
+            payload["model"] = "z-ai-latest"
+
+        if request.stream:
+            async def official_stream_generator() -> AsyncGenerator[dict, None]:
+                async with httpx.AsyncClient() as client:
+                    try:
+                        async with client.stream("POST", api_url, headers=headers, json=payload, timeout=60.0) as resp:
+                            if resp.status_code != 200:
+                                yield {"data": f"[ERROR] Official API returned status code {resp.status_code}"}
+                                yield {"data": "[DONE]"}
+                                return
+                            async for line in resp.aiter_lines():
+                                if line.strip():
+                                    yield {"data": line}
+                    except Exception as e:
+                        logger.error("Error in hybrid official API streaming: %s", e)
+                        yield {"data": f"[ERROR] {str(e)}"}
+                        yield {"data": "[DONE]"}
+            return EventSourceResponse(official_stream_generator())
+        else:
+            async with httpx.AsyncClient() as client:
+                try:
+                    resp = await client.post(api_url, headers=headers, json=payload, timeout=60.0)
+                    if resp.status_code != 200:
+                        raise HTTPException(status_code=resp.status_code, detail=f"Official API Error: {resp.text}")
+                    return JSONResponse(status_code=200, content=resp.json())
+                except Exception as e:
+                    logger.error("Error in hybrid official API: %s", e)
+                    raise HTTPException(status_code=500, detail=f"Hybrid API call failed: {str(e)}")
+
+    # 3. Create the internal Task
+    session_id = None
+    conversation_url = None
+    action = "continue"
+
+    if request.user:
+        user_str = request.user.strip()
+        if user_str.startswith("session:") or user_str.startswith("resume:"):
+            parts = user_str.split(":", 1)
+            target_sid = parts[1]
+            from core.sessions import session_store
+            session = await session_store.get_session(target_sid)
+            if session:
+                session_id = session.session_id
+                conversation_url = session.conversation_url
+                action = "resume_chat" if conversation_url else "new_chat"
+                logger.info("Resuming session: %s (url: %s)", session_id, conversation_url)
+        elif user_str.startswith("new_chat"):
+            from core.sessions import session_store
+            parts = user_str.split(":", 1)
+            prov = parts[1] if len(parts) > 1 else selected_provider
+            session = await session_store.create_session(provider=prov)
+            session_id = session.session_id
+            action = "new_chat"
+            logger.info("Created new session: %s for provider: %s", session_id, prov)
+        else:
+            # Maybe it is a raw session_id
+            from core.sessions import session_store
+            session = await session_store.get_session(user_str)
+            if session:
+                session_id = session.session_id
+                conversation_url = session.conversation_url
+                action = "resume_chat" if conversation_url else "new_chat"
+                logger.info("Resuming session via raw ID: %s", session_id)
+
+    task = Task(
+        provider=selected_provider,
+        model=requested_model,
+        messages=messages_dump,
+        temperature=request.temperature,
+        max_tokens=request.max_tokens,
+        stream=request.stream,
+        session_id=session_id,
+        conversation_url=conversation_url,
+        action=action,
+    )
+
+    # 4. Submit to queue
+    try:
+        handle = await task_queue.submit_task(task)
+    except asyncio.QueueFull:
+        error_detail = ErrorDetail(
+            message="Nancy task queue is currently full. Try again later.",
+            type="rate_limit_error",
+            code="429",
+        )
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content=ErrorResponse(error=error_detail).model_dump(),
+        )
+
+    # 5. Handle Streaming Response (stream=True)
+    if request.stream:
+        async def stream_generator() -> AsyncGenerator[dict, None]:
+            completion_id = handle.task.completion_id
+            try:
+                if request.tools:
+                    buffer = []
+                    is_potential_json = False
+                    streamed_buffer = False
+
+                    # Stream response chunks from the queue
+                    async for chunk in task_queue.stream_chunks(handle):
+                        if not buffer:
+                            stripped = chunk.strip()
+                            if stripped.startswith("{") or stripped.startswith("`"):
+                                is_potential_json = True
+                        
+                        if is_potential_json and not streamed_buffer:
+                            buffer.append(chunk)
+                            if sum(len(c) for c in buffer) > 1536:
+                                yield {
+                                    "data": ChatCompletionChunk.first_chunk(
+                                        completion_id, requested_model
+                                    ).to_sse_data()
+                                }
+                                for b_chunk in buffer:
+                                    yield {
+                                        "data": ChatCompletionChunk.content_chunk(
+                                            completion_id, requested_model, b_chunk
+                                        ).to_sse_data()
+                                    }
+                                streamed_buffer = True
+                        else:
+                            if not streamed_buffer and not is_potential_json:
+                                yield {
+                                    "data": ChatCompletionChunk.first_chunk(
+                                        completion_id, requested_model
+                                    ).to_sse_data()
+                                }
+                                is_potential_json = True
+                            yield {
+                                "data": ChatCompletionChunk.content_chunk(
+                                    completion_id, requested_model, chunk
+                                ).to_sse_data()
+                            }
+
+                    # Flush or parse buffer
+                    if is_potential_json and not streamed_buffer:
+                        full_text = "".join(buffer)
+                        tool_calls = parse_tool_call_json(full_text)
+                        if tool_calls:
+                            from models.openai import StreamChoice, DeltaContent
+                            yield {
+                                "data": ChatCompletionChunk(
+                                    id=completion_id,
+                                    model=requested_model,
+                                    choices=[
+                                        StreamChoice(
+                                            index=0,
+                                            delta=DeltaContent(
+                                                role="assistant",
+                                                tool_calls=tool_calls
+                                            ),
+                                            finish_reason="tool_calls"
+                                        )
+                                    ]
+                                ).to_sse_data()
+                            }
+                        else:
+                            yield {
+                                "data": ChatCompletionChunk.first_chunk(
+                                    completion_id, requested_model
+                                ).to_sse_data()
+                            }
+                            for b_chunk in buffer:
+                                yield {
+                                    "data": ChatCompletionChunk.content_chunk(
+                                        completion_id, requested_model, b_chunk
+                                    ).to_sse_data()
+                                }
+                else:
+                    yield {
+                        "data": ChatCompletionChunk.first_chunk(
+                            completion_id, requested_model
+                        ).to_sse_data()
+                    }
+                    async for chunk in task_queue.stream_chunks(handle):
+                        yield {
+                            "data": ChatCompletionChunk.content_chunk(
+                                completion_id, requested_model, chunk
+                            ).to_sse_data()
+                        }
+
+                # Final chunk: finish reason
+                yield {
+                    "data": ChatCompletionChunk.final_chunk(
+                        completion_id, requested_model, "stop"
+                    ).to_sse_data()
+                }
+
+                # Raw [DONE] terminator
+                yield {"data": "[DONE]"}
+
+            except Exception as exc:
+                logger.error("Error streaming chunks for task %s: %s", handle.task_id, exc)
+                error_chunk = ChatCompletionChunk.final_chunk(
+                    completion_id, requested_model, "length"
+                )
+                yield {"data": error_chunk.to_sse_data()}
+                yield {"data": "[DONE]"}
+            finally:
+                # Release resources
+                task_queue.cleanup_task(handle.task_id)
+
+        return EventSourceResponse(stream_generator())
+
+    # 6. Handle Non-streaming Blocking Response (stream=False)
+    else:
+        try:
+            # Drain the queue to aggregate response chunks
+            chunks = []
+            async for chunk in task_queue.stream_chunks(handle):
+                chunks.append(chunk)
+
+            # Check if task failed or timed out
+            if handle.task.status == TaskStatus.FAILED:
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=f"Chatbot provider failed: {handle.task.error}",
+                )
+            elif handle.task.status == TaskStatus.TIMED_OUT:
+                raise HTTPException(
+                    status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                    detail="Chatbot provider timed out responding.",
+                )
+
+            full_content = "".join(chunks)
+            if request.tools:
+                tool_calls = parse_tool_call_json(full_content)
+                if tool_calls:
+                    from models.openai import Choice, ChoiceMessage
+                    response = ChatCompletionResponse(
+                        id=handle.task.completion_id,
+                        model=requested_model,
+                        choices=[
+                            Choice(
+                                index=0,
+                                message=ChoiceMessage(
+                                    role="assistant",
+                                    content=None,
+                                    tool_calls=tool_calls
+                                ),
+                                finish_reason="tool_calls"
+                            )
+                        ]
+                    )
+                    return response
+
+            response = ChatCompletionResponse.from_content(
+                content=full_content,
+                model=requested_model,
+            )
+            response.id = handle.task.completion_id
+            return response
+
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error("Error completing non-streaming task %s: %s", handle.task_id, exc)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Nancy internal server error: {exc}",
+            )
+        finally:
+            # Release resources
+            task_queue.cleanup_task(handle.task_id)
+
+
+@router.get("/models", response_model=ModelListResponse)
+async def list_models(api_key: str = Depends(require_api_key)):
+    """
+    List Available OpenAI Models.
+    Maps to available providers configured in Nancy.
+    """
+    models = provider_router.get_available_models()
+    model_infos = [ModelInfo(id=model) for model in models]
+    return ModelListResponse(data=model_infos)
+
+
+@router.get("/models/{model}", response_model=ModelInfo)
+async def get_model(model: str, api_key: str = Depends(require_api_key)):
+    """
+    Retrieve specific model details.
+    """
+    models = provider_router.get_available_models()
+    if model.lower() not in models:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Model '{model}' not found in Nancy configuration.",
+        )
+    return ModelInfo(id=model.lower())
+
+
+
+============================================================
+FILE: hf-space/routers/sessions.py
+============================================================
+"""
+Nancy HF Space — Session REST API Router.
+
+Provides session management endpoints so agents can:
+  - Create new tracked conversation sessions
+  - List all sessions (optionally filtered by provider)
+  - Get a specific session's state
+  - Delete / archive sessions
+  - Update a session's conversation URL (called internally after task completion)
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from core.auth import require_api_key
+from core.sessions import session_store
+
+logger = logging.getLogger("nancy.sessions_router")
+
+router = APIRouter(prefix="/v1/sessions", tags=["Session Management"])
+
+
+# ── Request / Response Schemas ────────────────────────────────────────────────
+
+class CreateSessionRequest(BaseModel):
+    """Request body for creating a new conversation session."""
+    provider: str = Field(
+        ...,
+        description="Target provider key (e.g. 'chatgpt', 'gemini', 'nim'). "
+                    "Determines which browser tab / official API to use."
+    )
+    title: str | None = Field(
+        default=None,
+        description="Optional human-readable title for this session."
+    )
+    system_prompt: str | None = Field(
+        default=None,
+        description="Optional system prompt to prepend when starting a new chat."
+    )
+
+
+class UpdateSessionURLRequest(BaseModel):
+    """Internal: update a session's conversation URL after a chat."""
+    conversation_url: str = Field(
+        ...,
+        description="The browser tab URL for the active conversation (e.g. chatgpt.com/c/abc123)."
+    )
+    message_count_delta: int = Field(
+        default=1,
+        description="How many messages to add to the running total."
+    )
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@router.post("", status_code=status.HTTP_201_CREATED)
+async def create_session(
+    body: CreateSessionRequest,
+    api_key: str = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Create a new conversation session.
+
+    Returns the session_id and metadata. Use this session_id in subsequent
+    chat completion requests (as the `user` field or via custom header) to
+    automatically resume the same conversation tab.
+    """
+    session = await session_store.create_session(
+        provider=body.provider,
+        title=body.title,
+        system_prompt=body.system_prompt,
+    )
+    logger.info("Created session '%s' for provider '%s'", session.session_id[:8], body.provider)
+    return {
+        "session_id": session.session_id,
+        "message": f"Session created for provider '{body.provider}'.",
+        "session": session.to_dict(),
+    }
+
+
+@router.get("")
+async def list_sessions(
+    provider: str | None = Query(default=None, description="Filter by provider key."),
+    api_key: str = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    List all tracked sessions, optionally filtered by provider.
+    Sessions are sorted by last_used_at (most recent first).
+    """
+    sessions = await session_store.list_sessions(provider=provider)
+    return {
+        "total": len(sessions),
+        "sessions": [s.to_dict() for s in sessions],
+    }
+
+
+@router.get("/{session_id}")
+async def get_session(
+    session_id: str,
+    api_key: str = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Retrieve a specific session by its ID.
+    """
+    session = await session_store.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found.",
+        )
+    return session.to_dict()
+
+
+@router.patch("/{session_id}/url")
+async def update_session_url(
+    session_id: str,
+    body: UpdateSessionURLRequest,
+    api_key: str = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Update a session's conversation URL.
+
+    Called after a task completes to record the browser URL for the conversation,
+    enabling future resume operations.
+    """
+    session = await session_store.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found.",
+        )
+    await session_store.update_session_url(
+        session_id=session_id,
+        conversation_url=body.conversation_url,
+        message_count_delta=body.message_count_delta,
+    )
+    updated = await session_store.get_session(session_id)
+    return {
+        "message": "Session URL updated.",
+        "session": updated.to_dict() if updated else {},
+    }
+
+
+@router.delete("/{session_id}", status_code=status.HTTP_200_OK)
+async def delete_session(
+    session_id: str,
+    api_key: str = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Archive / soft-delete a session.
+    The session record is kept but marked as archived and excluded from list results.
+    """
+    deleted = await session_store.delete_session(session_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Session '{session_id}' not found.",
+        )
+    return {"message": f"Session '{session_id[:8]}...' archived successfully."}
+
+
+
+============================================================
+FILE: hf-space/routers/admin.py
+============================================================
+"""
+Nancy HF Space — Admin Dashboard.
+
+Exposes a beautiful, premium dark-mode, glassmorphic monitoring dashboard at /admin
+for visualizing system health, queues, circuit breakers, and active sessions.
+"""
+
+from __future__ import annotations
+
+import time
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import HTMLResponse
+
+from config import settings
+from core.auth import require_api_key
+from core.queue import task_queue
+from core.router import provider_router
+from core.sessions import session_store
+from core.redis_client import redis_client
+
+router = APIRouter(prefix="/admin", tags=["Nancy Administration"])
+
+# HTML template string containing premium CSS styled with glassmorphic cards and gradients
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nancy v2 — Control Center</title>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-dark: #090a0f;
+            --panel-bg: rgba(17, 19, 31, 0.7);
+            --border-glow: rgba(124, 58, 237, 0.25);
+            --primary: #8b5cf6;
+            --primary-glow: rgba(139, 92, 246, 0.4);
+            --accent: #06b6d4;
+            --accent-glow: rgba(6, 182, 212, 0.4);
+            --success: #10b981;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Plus Jakarta Sans', sans-serif;
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            min-height: 100vh;
+            overflow-x: hidden;
+            background-image: 
+                radial-gradient(circle at 10% 20%, rgba(139, 92, 246, 0.1) 0%, transparent 40%),
+                radial-gradient(circle at 90% 80%, rgba(6, 182, 212, 0.08) 0%, transparent 40%);
+            background-attachment: fixed;
+        }
+
+        /* Container & Navigation */
+        .container {
+            max-width: 1300px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2.5rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            padding-bottom: 1.5rem;
+        }
+
+        .logo-section h1 {
+            font-size: 1.8rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #a78bfa 0%, #22d3ee 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.5px;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .logo-section h1::before {
+            content: '';
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            background: #a78bfa;
+            border-radius: 3px;
+            box-shadow: 0 0 10px #a78bfa;
+            animation: pulse-glow 2s infinite;
+        }
+
+        .logo-section p {
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            margin-top: 0.2rem;
+        }
+
+        .sys-time {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            background: rgba(255, 255, 255, 0.03);
+            padding: 0.5rem 1rem;
+            border-radius: 99px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .stat-card {
+            background: var(--panel-bg);
+            border-radius: 16px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            padding: 1.5rem;
+            position: relative;
+            overflow: hidden;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            backdrop-filter: blur(10px);
+        }
+
+        .stat-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: linear-gradient(90deg, transparent, var(--primary-glow), transparent);
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-4px);
+            border-color: var(--border-glow);
+            box-shadow: 0 8px 30px rgba(0, 0, 0, 0.3);
+        }
+
+        .stat-card:hover::before {
+            opacity: 1;
+        }
+
+        .stat-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 1rem;
+        }
+
+        .stat-val {
+            font-size: 2.2rem;
+            font-weight: 700;
+            color: var(--text-main);
+            letter-spacing: -1px;
+            line-height: 1;
+        }
+
+        .stat-sub {
+            font-size: 0.8rem;
+            margin-top: 0.6rem;
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+
+        /* Circuit Breakers & Health Panel */
+        .main-layout {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        @media (max-width: 968px) {
+            .main-layout {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .panel {
+            background: var(--panel-bg);
+            border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            padding: 1.8rem;
+            backdrop-filter: blur(10px);
+        }
+
+        .panel-title {
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin-bottom: 1.5rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            padding-bottom: 0.8rem;
+        }
+
+        /* Provider Tables & Lists */
+        .provider-list {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .provider-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 1.2rem;
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid rgba(255, 255, 255, 0.03);
+            border-radius: 12px;
+            transition: background 0.2s ease;
+        }
+
+        .provider-row:hover {
+            background: rgba(255, 255, 255, 0.04);
+        }
+
+        .provider-info {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .provider-avatar {
+            width: 36px;
+            height: 36px;
+            border-radius: 8px;
+            background: linear-gradient(135deg, rgba(139, 92, 246, 0.2), rgba(6, 182, 212, 0.2));
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            color: var(--primary);
+            font-size: 0.9rem;
+            text-transform: uppercase;
+        }
+
+        .provider-details h3 {
+            font-size: 0.95rem;
+            font-weight: 600;
+            margin-bottom: 0.15rem;
+            text-transform: capitalize;
+        }
+
+        .provider-details span {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        .status-badge {
+            padding: 0.35rem 0.75rem;
+            border-radius: 99px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            display: flex;
+            align-items: center;
+            gap: 0.3rem;
+        }
+
+        .status-healthy {
+            background: rgba(16, 185, 129, 0.1);
+            color: var(--success);
+            border: 1px solid rgba(16, 185, 129, 0.2);
+        }
+
+        .status-degraded {
+            background: rgba(245, 158, 11, 0.1);
+            color: var(--warning);
+            border: 1px solid rgba(245, 158, 11, 0.2);
+        }
+
+        .status-broken {
+            background: rgba(239, 68, 68, 0.1);
+            color: var(--danger);
+            border: 1px solid rgba(239, 68, 68, 0.2);
+        }
+
+        /* Sessions list */
+        .session-item {
+            padding: 1rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .session-item:last-child {
+            border-bottom: none;
+        }
+
+        .session-meta h4 {
+            font-size: 0.9rem;
+            font-weight: 600;
+            margin-bottom: 0.2rem;
+            color: var(--text-main);
+        }
+
+        .session-meta p {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 250px;
+        }
+
+        .badge {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 0.25rem 0.5rem;
+            border-radius: 6px;
+            font-size: 0.7rem;
+            color: var(--text-muted);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        /* Animations */
+        @keyframes pulse-glow {
+            0%, 100% {
+                transform: scale(1);
+                box-shadow: 0 0 10px #a78bfa;
+            }
+            50% {
+                transform: scale(1.15);
+                box-shadow: 0 0 18px #a78bfa, 0 0 5px #22d3ee;
+            }
+        }
+
+        .pulse-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+        .pulse-dot.active {
+            background-color: var(--success);
+            box-shadow: 0 0 8px var(--success);
+            animation: pulse-active 1.5s infinite;
+        }
+        @keyframes pulse-active {
+            0% { transform: scale(0.9); opacity: 1; }
+            50% { transform: scale(1.2); opacity: 0.7; }
+            100% { transform: scale(0.9); opacity: 1; }
+        }
+
+        .refresh-btn {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--accent) 100%);
+            border: none;
+            color: white;
+            padding: 0.5rem 1.2rem;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.2s ease;
+        }
+
+        .refresh-btn:hover {
+            opacity: 0.9;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo-section">
+                <h1>NANCY CONTROL</h1>
+                <p>Advanced Free Chatbot Orchestrator & API Router</p>
+            </div>
+            <div class="sys-time">
+                SYS STATE: <span style="color: var(--success); font-weight:600;">OPERATIONAL</span>
+            </div>
+        </header>
+
+        <!-- Stats row -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-header">
+                    <span>Task Queue Depth</span>
+                    <span class="badge">SSE Queue</span>
+                </div>
+                <div class="stat-val">{queue_depth}</div>
+                <div class="stat-sub" style="color: var(--text-muted);">
+                    <span class="pulse-dot active"></span> Active tasks waiting for pickup
+                </div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-header">
+                    <span>Active Sessions</span>
+                    <span class="badge">Redis</span>
+                </div>
+                <div class="stat-val">{session_count}</div>
+                <div class="stat-sub" style="color: var(--text-muted);">
+                    Tracked multi-conversation sessions
+                </div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-header">
+                    <span>Extension Hub</span>
+                    <span class="badge">Relay Status</span>
+                </div>
+                <div class="stat-val" style="color: var(--success);">{ext_status}</div>
+                <div class="stat-sub" style="color: var(--text-muted);">
+                    Clients connected in real-time
+                </div>
+            </div>
+
+            <div class="stat-card">
+                <div class="stat-header">
+                    <span>Upstash Persistence</span>
+                    <span class="badge">Cache</span>
+                </div>
+                <div class="stat-val" style="color: {redis_color}; font-size: 1.8rem; margin-top: 0.3rem;">{redis_status}</div>
+                <div class="stat-sub" style="color: var(--text-muted);">
+                    State persistence engine status
+                </div>
+            </div>
+        </div>
+
+        <div class="main-layout">
+            <!-- Left panel: Health & Providers -->
+            <div class="panel">
+                <div class="panel-title">
+                    <span>Provider Status & Failover Configuration</span>
+                    <button class="refresh-btn" onclick="location.reload()">REFRESH STATE</button>
+                </div>
+                <div class="provider-list">
+                    {provider_rows}
+                </div>
+            </div>
+
+            <!-- Right panel: Active sessions list -->
+            <div class="panel">
+                <div class="panel-title">
+                    <span>Active Sessions</span>
+                    <span class="badge">{session_count} Total</span>
+                </div>
+                <div style="max-height: 400px; overflow-y: auto;">
+                    {session_rows}
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+@router.get("/", response_class=HTMLResponse)
+async def admin_dashboard(request: Request):
+    """Renders the control center admin status page."""
+    
+    # 1. Fetch current queue size
+    try:
+        queue_depth = len(task_queue.queue)
+    except:
+        queue_depth = 0
+
+    # 2. Check Extension SSE connections status
+    ext_connected = task_queue.is_extension_active()
+    ext_status = "Connected" if ext_connected else "Offline"
+
+    # 3. Check Redis Connection Status
+    redis_active = redis_client.is_enabled
+    redis_status = "ONLINE" if redis_active else "FALLBACK (IN-MEMORY)"
+    redis_color = "var(--success)" if redis_active else "var(--warning)"
+
+    # 4. Fetch Sessions list
+    try:
+        sessions = await session_store.list_sessions()
+        session_count = len(sessions)
+    except Exception as e:
+        sessions = []
+        session_count = 0
+
+    # 5. Build dynamic session items
+    session_rows = ""
+    if not sessions:
+        session_rows = '<div style="padding: 1.5rem; text-align: center; color: var(--text-muted); font-size: 0.85rem;">No active tracked sessions found.</div>'
+    else:
+        for sess in sessions[:8]: # Show top 8 active
+            session_rows += f"""
+            <div class="session-item">
+                <div class="session-meta">
+                    <h4>{sess.title}</h4>
+                    <p>{sess.conversation_url or 'Fresh Chat (No URL yet)'}</p>
+                </div>
+                <span class="badge" style="text-transform: capitalize;">{sess.provider}</span>
+            </div>
+            """
+
+    # 6. Fetch Providers circuit breaker states
+    # Default list of providers
+    all_providers = ["chatgpt", "gemini", "deepseek", "kimi", "claude", "nim", "zai"]
+    provider_rows = ""
+
+    for provider in all_providers:
+        # Determine status
+        is_healthy = provider_router.is_provider_healthy(provider)
+        
+        badge_class = "status-healthy" if is_healthy else "status-broken"
+        status_text = "HEALTHY" if is_healthy else "DEGRADED / DRAINED"
+        
+        # Determine adapter fallback priority indicator
+        fallback_pos = "Primary" if provider in provider_router.fallback_chain else "Bypass / API"
+        if provider in provider_router.fallback_chain:
+            idx = provider_router.fallback_chain.index(provider) + 1
+            fallback_pos = f"Fallback Chain #{idx}"
+
+        provider_rows += f"""
+        <div class="provider-row">
+            <div class="provider-info">
+                <div class="provider-avatar">{provider[:2]}</div>
+                <div class="provider-details">
+                    <h3>{provider}</h3>
+                    <span>Priority: {fallback_pos}</span>
+                </div>
+            </div>
+            <div class="status-badge {badge_class}">
+                <span class="pulse-dot active" style="background-color: currentColor;"></span>
+                {status_text}
+            </div>
+        </div>
+        """
+
+    # Render dashboard
+    rendered = DASHBOARD_HTML.format(
+        queue_depth=queue_depth,
+        session_count=session_count,
+        ext_status=ext_status,
+        redis_status=redis_status,
+        redis_color=redis_color,
+        session_rows=session_rows,
+        provider_rows=provider_rows
+    )
+    
+    return HTMLResponse(content=rendered)
+
+
+
+============================================================
+FILE: hf-space/models/openai.py
+============================================================
+"""
+Nancy — OpenAI-compatible Pydantic v2 schemas.
+
+These models exactly match the OpenAI Chat Completions API response format
+so that the official ``openai`` Python SDK works seamlessly.
+"""
+
+from __future__ import annotations
+
+import time
+import uuid
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _chatcmpl_id() -> str:
+    """Generate an OpenAI-style completion ID."""
+    return f"chatcmpl-{uuid.uuid4().hex[:29]}"
+
+
+def _unix_ts() -> int:
+    """Current UTC Unix timestamp."""
+    return int(time.time())
+
+
+# ── Request Models ────────────────────────────────────────────────────────────
+
+
+class ChatMessage(BaseModel):
+    """A single chat message in the OpenAI format."""
+
+    role: Literal["system", "user", "assistant", "function", "tool"] = Field(
+        ..., description="The role of the message author."
+    )
+    content: str | None = Field(
+        default=None, description="The text content of the message."
+    )
+    name: str | None = Field(
+        default=None, description="Optional name for the message author."
+    )
+    tool_call_id: str | None = Field(
+        default=None, description="Tool call that this message is responding to."
+    )
+
+
+class ChatCompletionRequest(BaseModel):
+    """
+    Incoming request body for ``POST /v1/chat/completions``.
+
+    Mirrors the subset of OpenAI fields that Nancy supports.
+    """
+
+    model: str = Field(
+        ..., description="Model/provider name, e.g. 'chatgpt', 'gemini'."
+    )
+    messages: list[ChatMessage] = Field(
+        ..., min_length=1, description="Conversation messages."
+    )
+    stream: bool = Field(
+        default=False, description="Whether to stream the response via SSE."
+    )
+    temperature: float | None = Field(
+        default=None, ge=0.0, le=2.0, description="Sampling temperature."
+    )
+    max_tokens: int | None = Field(
+        default=None, ge=1, description="Maximum tokens to generate."
+    )
+    top_p: float | None = Field(
+        default=None, ge=0.0, le=1.0, description="Nucleus sampling parameter."
+    )
+    stop: str | list[str] | None = Field(
+        default=None, description="Stop sequences."
+    )
+    user: str | None = Field(
+        default=None, description="End-user identifier for abuse tracking."
+    )
+    tools: list[dict] | None = Field(
+        default=None, description="A list of tools the model may call."
+    )
+    tool_choice: str | dict | None = Field(
+        default=None, description="Controls which (if any) tool is called."
+    )
+
+
+# ── Response Models — Non-streaming ──────────────────────────────────────────
+
+
+class UsageInfo(BaseModel):
+    """Token usage statistics."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
+class ChoiceMessage(BaseModel):
+    """The assistant's response message in a non-streaming completion."""
+
+    role: Literal["assistant"] = "assistant"
+    content: str | None = ""
+    tool_calls: list[dict] | None = Field(
+        default=None, description="The tool calls generated by the model."
+    )
+
+
+class Choice(BaseModel):
+    """A single choice in a non-streaming completion response."""
+
+    index: int = 0
+    message: ChoiceMessage = Field(default_factory=ChoiceMessage)
+    finish_reason: Literal["stop", "length", "content_filter", "tool_calls"] | None = None
+
+
+class ChatCompletionResponse(BaseModel):
+    """
+    Non-streaming response for ``POST /v1/chat/completions``.
+
+    Matches ``openai.types.chat.ChatCompletion``.
+    """
+
+    id: str = Field(default_factory=_chatcmpl_id)
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int = Field(default_factory=_unix_ts)
+    model: str = ""
+    choices: list[Choice] = Field(default_factory=lambda: [Choice()])
+    usage: UsageInfo = Field(default_factory=UsageInfo)
+    system_fingerprint: str | None = None
+
+    @classmethod
+    def from_content(
+        cls,
+        content: str,
+        model: str,
+        finish_reason: str = "stop",
+    ) -> ChatCompletionResponse:
+        """Build a complete response from a single content string."""
+        return cls(
+            model=model,
+            choices=[
+                Choice(
+                    index=0,
+                    message=ChoiceMessage(content=content),
+                    finish_reason=finish_reason,  # type: ignore[arg-type]
+                )
+            ],
+            usage=UsageInfo(
+                prompt_tokens=0,
+                completion_tokens=len(content.split()),
+                total_tokens=len(content.split()),
+            ),
+        )
+
+
+# ── Response Models — Streaming (SSE chunks) ─────────────────────────────────
+
+
+class DeltaContent(BaseModel):
+    """
+    Delta object inside a streaming chunk.
+
+    On the first chunk, ``role`` is set to ``"assistant"`` with no content.
+    On subsequent chunks, ``content`` carries the text fragment.
+    On the final chunk, both may be absent (empty delta).
+    """
+
+    role: Literal["assistant"] | None = None
+    content: str | None = None
+    tool_calls: list[dict] | None = Field(
+        default=None, description="The tool calls generated by the model."
+    )
+
+
+class StreamChoice(BaseModel):
+    """A single choice in a streaming chunk."""
+
+    index: int = 0
+    delta: DeltaContent = Field(default_factory=DeltaContent)
+    finish_reason: Literal["stop", "length", "content_filter", "tool_calls"] | None = None
+
+
+class ChatCompletionChunk(BaseModel):
+    """
+    A single SSE chunk for streaming ``POST /v1/chat/completions``.
+
+    Matches ``openai.types.chat.ChatCompletionChunk``.
+    """
+
+    id: str = Field(default_factory=_chatcmpl_id)
+    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
+    created: int = Field(default_factory=_unix_ts)
+    model: str = ""
+    choices: list[StreamChoice] = Field(default_factory=lambda: [StreamChoice()])
+    system_fingerprint: str | None = None
+
+    def to_sse_data(self) -> str:
+        """Serialize to the JSON string used in ``data: ...`` SSE frames."""
+        return self.model_dump_json(exclude_none=False)
+
+    # ── Convenience factories ─────────────────────────────────────────
+
+    @classmethod
+    def first_chunk(cls, completion_id: str, model: str) -> ChatCompletionChunk:
+        """Role-only opening chunk (no content)."""
+        return cls(
+            id=completion_id,
+            model=model,
+            choices=[
+                StreamChoice(
+                    delta=DeltaContent(role="assistant"),
+                    finish_reason=None,
+                )
+            ],
+        )
+
+    @classmethod
+    def content_chunk(
+        cls, completion_id: str, model: str, content: str
+    ) -> ChatCompletionChunk:
+        """A chunk carrying a text fragment."""
+        return cls(
+            id=completion_id,
+            model=model,
+            choices=[
+                StreamChoice(
+                    delta=DeltaContent(content=content),
+                    finish_reason=None,
+                )
+            ],
+        )
+
+    @classmethod
+    def final_chunk(
+        cls,
+        completion_id: str,
+        model: str,
+        finish_reason: str = "stop",
+    ) -> ChatCompletionChunk:
+        """Terminal chunk with ``finish_reason`` and empty delta."""
+        return cls(
+            id=completion_id,
+            model=model,
+            choices=[
+                StreamChoice(
+                    delta=DeltaContent(),
+                    finish_reason=finish_reason,  # type: ignore[arg-type]
+                )
+            ],
+        )
+
+
+# ── /v1/models response ──────────────────────────────────────────────────────
+
+
+class ModelInfo(BaseModel):
+    """A single model entry returned by ``GET /v1/models``."""
+
+    id: str
+    object: Literal["model"] = "model"
+    created: int = Field(default_factory=_unix_ts)
+    owned_by: str = "nancy"
+
+
+class ModelListResponse(BaseModel):
+    """Response body for ``GET /v1/models``."""
+
+    object: Literal["list"] = "list"
+    data: list[ModelInfo] = Field(default_factory=list)
+
+
+# ── Error response ────────────────────────────────────────────────────────────
+
+
+class ErrorDetail(BaseModel):
+    """OpenAI-style error detail."""
+
+    message: str
+    type: str = "invalid_request_error"
+    param: str | None = None
+    code: str | None = None
+
+
+class ErrorResponse(BaseModel):
+    """OpenAI-style error envelope."""
+
+    error: ErrorDetail
+
+
+
+============================================================
+FILE: hf-space/models/task.py
+============================================================
+"""
+Nancy — Task models.
+
+A *task* is the unit of work that flows through the system:
+  1. API receives a chat completion request → creates a Task
+  2. Task enters the queue → extension picks it up via SSE
+  3. Extension sends response chunks back → routed to the waiting API caller
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+import uuid
+from enum import StrEnum
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+
+class TaskStatus(StrEnum):
+    """Lifecycle states of a task."""
+
+    PENDING = "pending"
+    ASSIGNED = "assigned"
+    STREAMING = "streaming"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
+
+
+class Task(BaseModel):
+    """
+    Represents a single chat completion request flowing through the relay.
+
+    The ``completion_id`` is the OpenAI-format ``chatcmpl-*`` ID that will be
+    used across all SSE chunks for this task.
+    """
+
+    task_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
+    completion_id: str = Field(
+        default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex[:29]}"
+    )
+    provider: str = Field(..., description="Target provider, e.g. 'chatgpt'.")
+    model: str = Field(..., description="Original model name from the request.")
+    messages: list[dict[str, Any]] = Field(
+        ..., description="Chat messages to send to the provider."
+    )
+    temperature: float | None = None
+    max_tokens: int | None = None
+    stream: bool = True
+    status: TaskStatus = TaskStatus.PENDING
+    created_at: float = Field(default_factory=time.time)
+    assigned_at: float | None = None
+    completed_at: float | None = None
+    error: str | None = None
+
+    # ── Session-aware routing fields ──────────────────────────────────
+    session_id: str | None = Field(
+        default=None,
+        description="Optional session ID for conversation tracking."
+    )
+    conversation_url: str | None = Field(
+        default=None,
+        description="URL to navigate to when resuming a session (e.g. chatgpt.com/c/<id>)."
+    )
+    action: str = Field(
+        default="continue",
+        description="'new_chat' = open fresh conversation, 'resume_chat' = navigate to URL, 'continue' = send to current tab."
+    )
+
+    # These fields are NOT serialized — they are runtime-only handles.
+    model_config = {"arbitrary_types_allowed": True}
+
+    def to_extension_payload(self) -> dict[str, Any]:
+        """
+        Serialize the task for delivery to the Chrome extension via SSE.
+
+        Includes session navigation fields so the extension knows whether to
+        open a new chat, resume a specific conversation, or continue in the current tab.
+        """
+        return {
+            "task_id": self.task_id,
+            "provider": self.provider,
+            "model": self.model,
+            "messages": self.messages,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            # Session navigation
+            "session_id": self.session_id,
+            "conversation_url": self.conversation_url,
+            "action": self.action,
+        }
+
+    def to_status_dict(self) -> dict[str, Any]:
+        """Compact status representation for health / debug endpoints."""
+        return {
+            "task_id": self.task_id,
+            "provider": self.provider,
+            "model": self.model,
+            "status": self.status.value,
+            "created_at": self.created_at,
+            "assigned_at": self.assigned_at,
+            "completed_at": self.completed_at,
+            "error": self.error,
+        }
+
+
+class TaskHandle:
+    """
+    Runtime handle for an in-flight task.
+
+    Bundles the ``Task`` data model with the asyncio primitives needed
+    to coordinate between the API caller and the extension relay.
+
+    Attributes:
+        task: The Task data model.
+        chunk_queue: Queue where the extension pushes response chunks.
+        done_event: Event set when the extension signals completion.
+    """
+
+    __slots__ = ("task", "chunk_queue", "done_event", "created_at")
+
+    def __init__(self, task: Task) -> None:
+        self.task = task
+        self.chunk_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self.done_event = asyncio.Event()
+        self.created_at = time.time()
+
+    @property
+    def task_id(self) -> str:
+        return self.task.task_id
+
+    def push_chunk(self, chunk: str) -> None:
+        """
+        Enqueue a text chunk from the extension.
+
+        A ``None`` sentinel signals end-of-stream.
+        """
+        self.chunk_queue.put_nowait(chunk)
+
+    def finish(self, error: str | None = None) -> None:
+        """
+        Mark the task as done.
+
+        Pushes a ``None`` sentinel into the chunk queue and sets the
+        done event so the API handler can stop waiting.
+        """
+        if error:
+            self.task.status = TaskStatus.FAILED
+            self.task.error = error
+        else:
+            self.task.status = TaskStatus.COMPLETED
+        self.task.completed_at = time.time()
+        self.chunk_queue.put_nowait(None)  # sentinel
+        self.done_event.set()
+
+
+class ExtensionResponseChunk(BaseModel):
+    """
+    Payload sent by the Chrome extension via ``POST /ext/response``.
+    """
+
+    task_id: str = Field(..., description="ID of the task this chunk belongs to.")
+    chunk: str = Field(default="", description="Text fragment (may be empty on final).")
+    is_done: bool = Field(
+        default=False, description="True on the final chunk."
+    )
+    error: str | None = Field(
+        default=None, description="Error message if the extension failed."
+    )
+    # Session URL reporting: extension reports back the current tab URL after task completes
+    conversation_url: str | None = Field(
+        default=None,
+        description="Current browser tab URL after task completes. Used to update session records."
+    )
+
+
+class ExtensionHeartbeat(BaseModel):
+    """
+    Payload sent by the Chrome extension via ``POST /ext/heartbeat``.
+    """
+
+    extension_id: str = Field(
+        default="default",
+        description="Unique extension instance identifier.",
+    )
+    timestamp: float = Field(
+        default_factory=time.time,
+        description="Client-side UTC Unix timestamp.",
+    )
+    active_tasks: list[str] = Field(
+        default_factory=list,
+        description="Task IDs currently being processed by this extension.",
+    )
+
+

@@ -1,0 +1,21 @@
+# .ruff.toml - Swarm Orchestrator Ruff Configuration
+line-length = 100
+target-version = "py313"
+
+[lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort (import sorting)
+    "C",   # mccabe complexity
+    "ASYNC", # flake8-async (async pitfalls)
+    "UP",  # pyupgrade (modern python syntax)
+]
+ignore = ["E501"]
+
+[lint.per-file-ignores]
+"tests/*" = ["F401"]
+
+[lint.mccabe]
+max-complexity = 10

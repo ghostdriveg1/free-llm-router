@@ -1,0 +1,57 @@
+name: Deploy Swarm Orchestrator
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'olympus-swarm/**'
+      - '.github/workflows/deploy_swarm.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Quality Tools
+        run: |
+          pip install ruff pytest
+
+      - name: Run Ruff Lint Check
+        run: |
+          cd olympus-swarm
+          if [ -f .ruff.toml ]; then
+            ruff check .
+          else
+            ruff check src/
+          fi
+
+      - name: Run Base CI Quality Tests
+        run: |
+          cd olympus-swarm
+          if [ -d tests ]; then
+            pytest tests/
+          fi
+
+      - name: Deploy to Hugging Face Spaces
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          cd olympus-swarm
+          git init
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add .
+          git commit -m "Deploy Swarm Orchestrator [skip ci]"
+          git remote add hf https://LOQ:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/ghostdriveg1/olympus-brain
+          git push -f hf master:main

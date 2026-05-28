@@ -1,0 +1,29 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Caches
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
+
+# Node.js
+node_modules/
+npm-debug.log*
+
+# Environment and Secrets
+*.env
+secrets.json
+credentials.env
+
+# System / OS files
+.DS_Store
+Thumbs.db
+*.log

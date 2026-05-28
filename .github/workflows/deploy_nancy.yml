@@ -1,0 +1,45 @@
+name: Deploy Nancy Relay Gateway
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'hf-space/**'
+      - '.github/workflows/deploy_nancy.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Quality Tools
+        run: |
+          pip install ruff pytest
+
+      - name: Run Ruff Lint Check
+        run: |
+          ruff check hf-space/
+
+      - name: Deploy to Hugging Face Spaces
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          cd hf-space
+          git init
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add .
+          git commit -m "Deploy Nancy Relay Gateway [skip ci]"
+          git remote add hf https://LOQ:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/ghostdriveg1/free-llm-router
+          git push -f hf master:main
