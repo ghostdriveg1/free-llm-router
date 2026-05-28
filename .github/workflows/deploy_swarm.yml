@@ -42,7 +42,7 @@ jobs:
 
       - name: Deploy to Hugging Face Spaces
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN_ULTRON }}
         run: |
           cd olympus-swarm
           git init
@@ -51,5 +51,5 @@ jobs:
           git checkout -b main
           git add .
           git commit -m "Deploy Swarm Orchestrator [skip ci]"
-          git remote add hf https://LOQ:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/manus2/ultron-test-agent
+          git remote add hf https://LOQ:${{ secrets.HF_TOKEN_ULTRON }}@huggingface.co/spaces/manus2/ultron-test-agent
           git push -f hf main:main

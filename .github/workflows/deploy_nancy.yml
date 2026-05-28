@@ -30,7 +30,7 @@ jobs:
 
       - name: Deploy to Hugging Face Spaces
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN_NANCY }}
         run: |
           cd hf-space
           git init
@@ -39,5 +39,5 @@ jobs:
           git checkout -b main
           git add .
           git commit -m "Deploy Nancy Relay Gateway [skip ci]"
-          git remote add hf https://LOQ:${{ secrets.HF_TOKEN }}@huggingface.co/spaces/ghostdrive1/free-llm-router
+          git remote add hf https://LOQ:${{ secrets.HF_TOKEN_NANCY }}@huggingface.co/spaces/ghostdrive1/free-llm-router
           git push -f hf main:main
