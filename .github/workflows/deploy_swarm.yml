@@ -20,9 +20,10 @@ jobs:
         with:
           python-version: '3.13'
 
-      - name: Install Quality Tools
+      - name: Install Quality Tools & Dependencies
         run: |
           pip install ruff pytest
+          pip install -r olympus-swarm/requirements.txt
 
       - name: Run Ruff Lint Check
         run: |
