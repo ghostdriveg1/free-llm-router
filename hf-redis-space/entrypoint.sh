@@ -84,7 +84,7 @@ data['http_basic_auth'] = [f'nancy_admin:{os.getenv(\"NANCY_REDIS_SECRET\")}']
 with open('/app/webdis.json', 'w') as f:
     json.dump(data, f, indent=2)
 "
-else:
+else
     echo "[WARNING] NANCY_REDIS_SECRET missing! Webdis REST server is running unsecured!"
 fi
 
