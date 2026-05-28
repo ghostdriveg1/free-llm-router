@@ -77,7 +77,7 @@ if [ -n "$NANCY_REDIS_SECRET" ]; then
     # Webdis supports "http_basic_auth": ["user:password"] at root level.
     # Let's dynamically patch webdis.json to inject the credentials!
     python3 -c "
-import json
+import os, json
 with open('/app/webdis.json', 'r') as f:
     data = json.load(f)
 data['http_basic_auth'] = [f'nancy_admin:{os.getenv(\"NANCY_REDIS_SECRET\")}']
