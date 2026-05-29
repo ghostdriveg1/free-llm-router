@@ -761,15 +761,16 @@ async def admin_dashboard(request: Request):
         </div>
         """
 
-    # Render dashboard
-    rendered = DASHBOARD_HTML.format(
-        queue_depth=queue_depth,
-        session_count=session_count,
-        ext_status=ext_status,
-        redis_status=redis_status,
-        redis_color=redis_color,
-        session_rows=session_rows,
-        provider_rows=provider_rows
+    # Render dashboard safely using simple replacement to avoid CSS/JS brace clashes
+    rendered = (
+        DASHBOARD_HTML
+        .replace("{queue_depth}", str(queue_depth))
+        .replace("{session_count}", str(session_count))
+        .replace("{ext_status}", str(ext_status))
+        .replace("{redis_status}", str(redis_status))
+        .replace("{redis_color}", str(redis_color))
+        .replace("{session_rows}", str(session_rows))
+        .replace("{provider_rows}", str(provider_rows))
     )
     
     return HTMLResponse(content=rendered)
