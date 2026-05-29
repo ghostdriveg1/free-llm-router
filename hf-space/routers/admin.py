@@ -690,7 +690,7 @@ async def admin_dashboard(request: Request):
     
     # 1. Fetch current queue size
     try:
-        queue_depth = len(task_queue.queue)
+        queue_depth = task_queue.pending_count
     except Exception:
         queue_depth = 0
 

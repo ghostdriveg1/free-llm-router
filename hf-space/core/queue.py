@@ -238,6 +238,16 @@ class TaskQueue:
         """Return recent task history."""
         return self._history[-limit:]
 
+    def is_extension_active(self) -> bool:
+        """Check if there is at least one active extension connection."""
+        try:
+            from routers.extension import active_extensions
+            now = time.time()
+            return any((now - last_seen) < 45.0 for last_seen in active_extensions.values())
+        except Exception:
+            return False
+
 
 # Module-level singleton
 task_queue = TaskQueue()
+
