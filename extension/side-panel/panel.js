@@ -31,7 +31,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 async function loadConfig() {
   const state = await storage.getState();
-  formHfUrl.value = state.hfSpaceUrl || 'https://nancy.hf.space';
+  formHfUrl.value = state.hfSpaceUrl || 'http://127.0.0.1:7860';
   formApiKey.value = state.apiKey || '';
   formTypingMode.value = state.typingMode || 'standard';
 }

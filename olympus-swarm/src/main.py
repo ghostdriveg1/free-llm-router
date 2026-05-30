@@ -1377,7 +1377,8 @@ async def run_swarm_dispatch_task(url: str, key: str, model: str, prompt: str) -
             if not scraped_output:
                 log_swarm_activity("MANAGER", f"Initiating direct HTTPX stream request to Nancy completions API ({target_worker_model})...", "INFO")
                 try:
-                    async with httpx.AsyncClient(timeout=60.0) as client:
+                    # 180s budget: fast-type (instant) + ChatGPT generation (30-60s) + SSE relay
+                    async with httpx.AsyncClient(timeout=180.0) as client:
                         headers = {
                             "Authorization": f"Bearer {key}",
                             "Content-Type": "application/json"

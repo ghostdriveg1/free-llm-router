@@ -29,6 +29,7 @@ MODEL_TO_PROVIDER: dict[str, str] = {
     "chatgpt": "chatgpt",
     "gpt-4": "chatgpt",
     "gpt-4o": "chatgpt",
+    "gpt-40": "chatgpt",
     "gpt-4o-mini": "chatgpt",
     "gpt-3.5-turbo": "chatgpt",
     # Gemini

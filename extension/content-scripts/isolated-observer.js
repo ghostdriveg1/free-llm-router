@@ -18,17 +18,38 @@
   const PROVIDERS = {
     chatgpt: {
       name: 'ChatGPT',
-      input: ['#prompt-textarea', 'div[contenteditable="true"][id="prompt-textarea"]', '[contenteditable="true"]'],
-      submit: ['button[data-testid="send-button"]', 'button[data-testid="fruitjuice-send-button"]', 'button[aria-label="Send prompt"]', '#composer-background button[aria-label]'],
+      input: ['#prompt-textarea', 'div[contenteditable="true"][id="prompt-textarea"]', 'div[contenteditable="true"]', '[contenteditable="true"]'],
+      submit: [
+        'button[data-testid="send-button"]',
+        'button[data-testid="fruitjuice-send-button"]',
+        'button[aria-label="Send prompt"]',
+        'button[aria-label="Send message"]',
+        '#composer-background button[aria-label]',
+        'button[class*="send"]',
+      ],
       response: '[data-message-author-role="assistant"]',
-      streaming: '.result-streaming, [class*="result-streaming"], button[aria-label="Stop generating"]',
+      streaming: '.result-streaming, [class*="result-streaming"], button[aria-label="Stop generating"], button[data-testid="stop-button"]',
     },
     gemini: {
       name: 'Gemini',
-      input: ['div.ql-editor[contenteditable="true"]', 'div[contenteditable="true"][aria-label="Prompt"]', 'textarea', '[contenteditable="true"]'],
-      submit: ['button.send-button', 'button[aria-label="Send message"]', 'button[class*="send"]', 'div[aria-label="Send message"] button'],
-      response: '.message-content, [data-message-author-role="assistant"], div.model-response',
-      streaming: '.generating, .streaming, [class*="generating"]',
+      input: [
+        'div.ql-editor[contenteditable="true"]',
+        'div[contenteditable="true"][aria-label="Enter a prompt here"]',
+        'div[contenteditable="true"][aria-label="Prompt"]',
+        'rich-textarea div[contenteditable="true"]',
+        'textarea',
+        '[contenteditable="true"]',
+      ],
+      submit: [
+        'button.send-button[aria-label]',
+        'button[aria-label="Send message"]',
+        'button[aria-label="Submit"]',
+        'button[class*="send"]',
+        'div[aria-label="Send message"] button',
+        'mat-icon-button[aria-label*="send"]',
+      ],
+      response: 'model-response .markdown, model-response, .model-response-text, [class*="model-response"], message-content',
+      streaming: 'model-response.generating, .loading-indicator, [class*="generating"], mat-progress-spinner',
     },
     deepseek: {
       name: 'DeepSeek',
@@ -150,22 +171,30 @@
         await window.NancyInputSimulator.typePrompt(inputEl, prompt);
         log('Keystroke simulation complete.');
 
-        // Pause to let Vue/React state updates propagate to the DOM and enable the submit button
-        await window.NancyInputSimulator.sleep(300);
-
-        // 3. Locate submit button (do this AFTER typing so it is guaranteed to be rendered)
-        const submitBtn = findElement(config.submit);
-        
+        // 3. Locate and click submit button.
+        // After fast-mode injection, React/ProseMirror needs time to process
+        // the new content and enable the send button. Poll for up to 1.5 seconds.
+        let submitBtn = null;
         let submitted = false;
-        if (submitBtn && !submitBtn.disabled && submitBtn.getAttribute('aria-disabled') !== 'true') {
-          submitBtn.click();
-          log('Send button clicked.');
-          submitted = true;
-        } else {
-          log('Submit button not found, disabled, or aria-disabled. Trying Enter key fallback...');
+        const BUTTON_POLL_MS = 100;
+        const BUTTON_POLL_ATTEMPTS = 15; // 15 × 100ms = 1.5 seconds
+
+        for (let attempt = 0; attempt < BUTTON_POLL_ATTEMPTS; attempt++) {
+          await window.NancyInputSimulator.sleep(BUTTON_POLL_MS);
+          submitBtn = findElement(config.submit);
+          if (submitBtn && !submitBtn.disabled && submitBtn.getAttribute('aria-disabled') !== 'true') {
+            submitBtn.click();
+            log('Send button clicked (attempt ' + (attempt + 1) + ').');
+            submitted = true;
+            break;
+          }
         }
 
-        // 4. Enter-key fallback: Dispatch keyboard Enter event on input element if not clicked
+        if (!submitted) {
+          log('Submit button not found or still disabled after 1.5s. Trying Enter key fallback...');
+        }
+
+        // 4. Enter-key fallback
         if (!submitted) {
           log('Simulating Enter keypress event to submit...');
           inputEl.focus();
@@ -178,8 +207,6 @@
             cancelable: true,
           });
           inputEl.dispatchEvent(enterEvent);
-          
-          // Also dispatch keypress/keyup for frameworks (Kimi/Vue)
           inputEl.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
           inputEl.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
           log('Enter keypress events dispatched.');
@@ -273,7 +300,7 @@
         taskId: currentTaskId,
       });
       cleanupTaskState();
-    }, 20000); // 20 seconds of no changes -> complete
+    }, 30000); // 30 seconds of no changes -> complete (was 20s)
   }
 
   function cleanupTaskState() {

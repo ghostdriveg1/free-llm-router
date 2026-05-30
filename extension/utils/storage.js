@@ -44,17 +44,21 @@ const MAX_LOGS = 200;
 
 /** Default state shape used when storage is empty. */
 const DEFAULT_STATE = {
-  hfSpaceUrl: 'https://nancy.hf.space',
+  // For local dev: use http://127.0.0.1:7860
+  // For production HF Space: change to https://nancy.hf.space
+  hfSpaceUrl: 'http://127.0.0.1:7860',
   apiKey: '',
   typingMode: 'fast', // 'standard' | 'fast'
   connected: false,
   lastEventId: '',
   providers: {
-    chatgpt: { name: 'ChatGPT', status: 'offline', tabId: -1, lastSeen: 0 },
-    gemini:  { name: 'Gemini',  status: 'offline', tabId: -1, lastSeen: 0 },
-    deepseek:{ name: 'DeepSeek',status: 'offline', tabId: -1, lastSeen: 0 },
-    kimi:    { name: 'Kimi',    status: 'offline', tabId: -1, lastSeen: 0 },
-    claude:  { name: 'Claude',  status: 'offline', tabId: -1, lastSeen: 0 },
+    chatgpt: { name: 'ChatGPT',      status: 'offline', tabId: -1, lastSeen: 0 },
+    gemini:  { name: 'Gemini',       status: 'offline', tabId: -1, lastSeen: 0 },
+    deepseek:{ name: 'DeepSeek',     status: 'offline', tabId: -1, lastSeen: 0 },
+    kimi:    { name: 'Kimi',         status: 'offline', tabId: -1, lastSeen: 0 },
+    claude:  { name: 'Claude',       status: 'offline', tabId: -1, lastSeen: 0 },
+    nim:     { name: 'NVIDIA NIM',   status: 'offline', tabId: -1, lastSeen: 0 },
+    zai:     { name: 'z.ai',         status: 'offline', tabId: -1, lastSeen: 0 },
   },
   taskQueue: [],
   logs: [],

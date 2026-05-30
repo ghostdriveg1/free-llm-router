@@ -54,8 +54,9 @@
     element.focus();
     await sleep(200);
 
-    // Load typingMode from storage state
-    let typingMode = 'standard';
+    // Load typingMode from storage state — default to 'fast' so long prompts never
+    // time out Ultron / client timeouts. User can switch to 'standard' in the panel.
+    let typingMode = 'fast';
     try {
       const storageData = await new Promise((resolve) => {
         chrome.storage.local.get(['typingMode'], resolve);
@@ -64,7 +65,7 @@
         typingMode = storageData.typingMode;
       }
     } catch (err) {
-      console.warn('[Nancy/Simulator] Failed to load typingMode:', err);
+      console.warn('[Nancy/Simulator] Failed to load typingMode — defaulting to fast:', err);
     }
 
     // Clear existing text if any

@@ -17,13 +17,69 @@ import * as storage from './utils/storage.js';
 import { SSEParser } from './utils/sse-parser.js';
 import { sleep } from './utils/timing.js';
 
-const EXTENSION_ID = 'nancy-extension-' + Math.random().toString(36).substr(2, 9);
+// ─── Stable Extension ID (survives service worker restarts) ────────────────
+// Generated once and persisted to storage. If Chrome kills and restarts the
+// worker, we reconnect to Nancy with the same ID so in-flight tasks are not lost.
+let EXTENSION_ID = 'nancy-extension-pending';
 let activeReader = null;
 let reconnectTimer = null;
 let currentTaskMap = new Map(); // task_id -> { providerKey, tabId }
 
+async function getOrCreateExtensionId() {
+  const stored = await new Promise(resolve => chrome.storage.local.get('extensionId', resolve));
+  if (stored.extensionId) {
+    EXTENSION_ID = stored.extensionId;
+  } else {
+    EXTENSION_ID = 'nancy-extension-' + Math.random().toString(36).substr(2, 9);
+    await chrome.storage.local.set({ extensionId: EXTENSION_ID });
+  }
+  return EXTENSION_ID;
+}
+
+// ─── Real-Time Open Tab Discovery & Health Sync ──────────────────────────────
+async function scanOpenTabs() {
+  try {
+    const state = await storage.getState();
+    const tabs = await chrome.tabs.query({});
+    const providerKeys = Object.keys(state.providers);
+    
+    for (const key of providerKeys) {
+      const adapter = getAdapter(key);
+      if (!adapter) continue;
+      
+      const matchedTab = tabs.find(t => t.url && adapter.matchesUrl(t.url));
+      const current = state.providers[key];
+      
+      if (matchedTab) {
+        if (current.status !== 'healthy' || current.tabId !== matchedTab.id) {
+          await storage.updateProvider(key, { tabId: matchedTab.id, status: 'healthy' });
+          await storage.appendLog('info', `Detected active tab for ${adapter.name} (Tab ID: ${matchedTab.id}). Marked as Healthy.`);
+        }
+      } else {
+        if (current.status !== 'offline') {
+          await storage.updateProvider(key, { tabId: -1, status: 'offline' });
+          await storage.appendLog('info', `${adapter.name} tab closed or not found. Marked as Offline.`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[Nancy/SW] Error scanning open tabs:', err);
+  }
+}
+
+// Bind tab lifecycle listeners for real-time reactivity
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status === 'complete' || changeInfo.url) {
+    scanOpenTabs();
+  }
+});
+chrome.tabs.onRemoved.addListener(() => {
+  scanOpenTabs();
+});
+
 // ─── Startup Hook ───────────────────────────────────────────────────────────
 chrome.runtime.onInstalled.addListener(async () => {
+  await getOrCreateExtensionId();
   await storage.resetState();
   await storage.appendLog('info', `Nancy installed. Extension ID: ${EXTENSION_ID}`);
   
@@ -34,10 +90,22 @@ chrome.runtime.onInstalled.addListener(async () => {
   
   setupAlarms();
   connectToServer();
+  await scanOpenTabs();
 });
 
 chrome.runtime.onStartup.addListener(async () => {
+  await getOrCreateExtensionId();
   await storage.appendLog('info', 'Nancy service worker started.');
+
+  // ── URL Migration: update old default HF Space URL to local dev URL ──
+  const currentState = await storage.getState();
+  const OLD_DEFAULT = 'https://nancy.hf.space';
+  const NEW_DEFAULT = 'http://127.0.0.1:7860';
+  if (currentState.hfSpaceUrl === OLD_DEFAULT) {
+    await storage.setState({ hfSpaceUrl: NEW_DEFAULT });
+    await storage.appendLog('info', `URL migrated from ${OLD_DEFAULT} → ${NEW_DEFAULT}`);
+  }
+  // ────────────────────────────────────────────────────────────────────
   
   if (chrome.sidePanel && chrome.sidePanel.setPanelBehavior) {
     await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
@@ -45,6 +113,7 @@ chrome.runtime.onStartup.addListener(async () => {
   
   setupAlarms();
   connectToServer();
+  await scanOpenTabs();
 });
 
 // ─── Alarms & Keep-Alive ─────────────────────────────────────────────────────
@@ -59,17 +128,24 @@ function setupAlarms() {
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'heartbeat') {
     await sendHeartbeat();
+    await scanOpenTabs();
   } else if (alarm.name === 'connection_check') {
     const state = await storage.getState();
     if (!state.connected) {
       await storage.appendLog('warn', 'Connection check: offline. Reconnecting...');
       connectToServer();
     }
+    await scanOpenTabs();
   }
 });
 
 // ─── SSE Streaming Connection ────────────────────────────────────────────────
 async function connectToServer() {
+  // Ensure stable ID is loaded (worker may be woken by alarm before startup fires)
+  if (EXTENSION_ID === 'nancy-extension-pending') {
+    await getOrCreateExtensionId();
+  }
+
   if (activeReader) {
     try {
       await activeReader.cancel();
@@ -79,7 +155,7 @@ async function connectToServer() {
 
   const state = await storage.getState();
   const url = state.hfSpaceUrl;
-  const key = state.apiKey || 'nancy-ext-dev-secret'; // Fallback to extension secret
+  const key = state.apiKey || 'nancy_ext_sec_8d4f0b21a3672d9e18b5'; // Fallback to extension secret
 
   if (!url) {
     await storage.appendLog('error', 'Nancy Server URL not configured.');
@@ -156,7 +232,7 @@ async function sendHeartbeat() {
   const state = await storage.getState();
   if (!state.hfSpaceUrl) return;
 
-  const secret = state.apiKey || 'nancy-ext-dev-secret';
+  const secret = state.apiKey || 'nancy_ext_sec_8d4f0b21a3672d9e18b5';
   const url = `${state.hfSpaceUrl.replace(/\/$/, '')}/ext/heartbeat`;
 
   try {
@@ -365,7 +441,7 @@ async function postLogToServer(provider, level, messageText) {
   const state = await storage.getState();
   if (!state.hfSpaceUrl) return;
 
-  const secret = state.apiKey || 'nancy-ext-dev-secret';
+  const secret = state.apiKey || 'nancy_ext_sec_8d4f0b21a3672d9e18b5';
   const url = `${state.hfSpaceUrl.replace(/\/$/, '')}/ext/log`;
 
   try {
@@ -413,7 +489,7 @@ async function handleResponseChunk(taskId, chunk) {
   const state = await storage.getState();
   if (!state.hfSpaceUrl) return;
 
-  const secret = state.apiKey || 'nancy-ext-dev-secret';
+  const secret = state.apiKey || 'nancy_ext_sec_8d4f0b21a3672d9e18b5';
   const url = `${state.hfSpaceUrl.replace(/\/$/, '')}/ext/response`;
 
   try {
@@ -441,7 +517,7 @@ async function handleTaskComplete(taskId) {
   const state = await storage.getState();
   if (!state.hfSpaceUrl) return;
 
-  const secret = state.apiKey || 'nancy-ext-dev-secret';
+  const secret = state.apiKey || 'nancy_ext_sec_8d4f0b21a3672d9e18b5';
   const url = `${state.hfSpaceUrl.replace(/\/$/, '')}/ext/response`;
 
   // Capture current tab URL for session persistence
@@ -489,7 +565,7 @@ async function reportError(taskId, errorMsg) {
   const state = await storage.getState();
   if (!state.hfSpaceUrl) return;
 
-  const secret = state.apiKey || 'nancy-ext-dev-secret';
+  const secret = state.apiKey || 'nancy_ext_sec_8d4f0b21a3672d9e18b5';
   const url = `${state.hfSpaceUrl.replace(/\/$/, '')}/ext/response`;
 
   try {

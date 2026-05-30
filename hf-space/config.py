@@ -11,8 +11,12 @@ import json
 import logging
 from typing import Any
 
+from dotenv import load_dotenv
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
+
+# Load environment variables from .env file
+load_dotenv()
 
 logger = logging.getLogger("nancy.config")
 
@@ -52,7 +56,7 @@ class Settings(BaseSettings):
         default="chatgpt",
         description="Default provider when the model name is not recognized.",
     )
-    fallback_chain: list[str] = Field(
+    fallback_chain: Any = Field(
         default=["chatgpt", "gemini", "deepseek", "kimi", "claude", "nim", "zai"],
         description="Ordered list of providers to try on failure.",
     )
@@ -82,8 +86,8 @@ class Settings(BaseSettings):
 
     # ── Task Queue ────────────────────────────────────────────────────
     task_timeout_seconds: float = Field(
-        default=120.0,
-        description="Max seconds to wait for extension to complete a task.",
+        default=240.0,
+        description="Max seconds to wait for extension to complete a task (fast-type + AI generation + relay).",
     )
     task_queue_max_size: int = Field(
         default=100,
@@ -102,7 +106,7 @@ class Settings(BaseSettings):
 
     # ── Server ────────────────────────────────────────────────────────
     log_level: str = Field(default="INFO", description="Logging level.")
-    cors_origins: list[str] = Field(
+    cors_origins: Any = Field(
         default=["*"],
         description="Allowed CORS origins.",
     )

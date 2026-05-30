@@ -25,6 +25,8 @@
     '/api/v1/chat/completions',   // Claude
     '/v1/chat/completions',       // NIM Portal & z.ai (OpenAI-compatible)
     '/api/chat',                  // z.ai alternative
+    'streamGenerateContent',      // Gemini (Google AI Studio & gemini.google.com)
+    'generateContent',            // Gemini non-streaming fallback
   ];
 
   function isTargetUrl(url) {
@@ -33,6 +35,7 @@
 
   function detectProvider(url) {
     if (url.includes('openai.com') || url.includes('chatgpt.com')) return 'chatgpt';
+    if (url.includes('gemini.google.com') || url.includes('google.com') || url.includes('generativelanguage.googleapis.com')) return 'gemini';
     if (url.includes('deepseek.com')) return 'deepseek';
     if (url.includes('kimi.moonshot.cn')) return 'kimi';
     if (url.includes('claude.ai')) return 'claude';
@@ -50,6 +53,19 @@
         const delta = fullText.substring(chatgptLastLength);
         chatgptLastLength = fullText.length;
         return delta;
+      }
+    }
+    return null;
+  }
+
+  function parseGeminiChunk(json) {
+    // Gemini streamGenerateContent returns arrays: [{candidates:[{content:{parts:[{text:"..."}]}}]}]
+    // Or sometimes a single object with the same structure.
+    const candidates = json?.candidates;
+    if (Array.isArray(candidates) && candidates.length > 0) {
+      const parts = candidates[0]?.content?.parts;
+      if (Array.isArray(parts) && parts.length > 0) {
+        return parts.map(p => p.text || '').join('');
       }
     }
     return null;
@@ -88,6 +104,8 @@
       switch (provider) {
         case 'chatgpt':
           return parseChatGPTChunk(json);
+        case 'gemini':
+          return parseGeminiChunk(json);
         case 'deepseek':
           return parseDeepSeekChunk(json);
         case 'kimi':

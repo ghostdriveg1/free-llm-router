@@ -32,7 +32,15 @@
     "https://kimi.com/*",
     "https://*.kimi.com/*",
     "https://claude.ai/*",
-    "https://*.claude.ai/*"
+    "https://*.claude.ai/*",
+    "https://build.nvidia.com/*",
+    "https://*.build.nvidia.com/*",
+    "https://nim.developer.nvidia.com/*",
+    "https://*.nim.developer.nvidia.com/*",
+    "https://z.ai/*",
+    "https://*.z.ai/*",
+    "https://chat.z.ai/*",
+    "https://*.chat.z.ai/*"
   ],
 
   "background": {
@@ -159,6 +167,52 @@
     {
       "matches": [
         "https://claude.ai/*"
+      ],
+      "js": [
+        "content-scripts/main-interceptor.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://build.nvidia.com/*",
+        "https://nim.developer.nvidia.com/*"
+      ],
+      "js": [
+        "content-scripts/input-simulator.js",
+        "content-scripts/isolated-observer.js"
+      ],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": [
+        "https://build.nvidia.com/*",
+        "https://nim.developer.nvidia.com/*"
+      ],
+      "js": [
+        "content-scripts/main-interceptor.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://z.ai/*",
+        "https://chat.z.ai/*"
+      ],
+      "js": [
+        "content-scripts/input-simulator.js",
+        "content-scripts/isolated-observer.js"
+      ],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    },
+    {
+      "matches": [
+        "https://z.ai/*",
+        "https://chat.z.ai/*"
       ],
       "js": [
         "content-scripts/main-interceptor.js"
